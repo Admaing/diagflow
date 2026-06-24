@@ -17,15 +17,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from diagflow.core.llm import LLMClient, LLMResponse
-from diagflow.core.engine import DiagnosisEngine, DiagnosisReport
-from diagflow.core.agent import Agent
+from diagflow.core.diag_agent import DiagAgent, DiagnosisReport
 from diagflow.core.memory import EvidencePool
-from diagflow.core.validator import ConclusionValidator, make_default_verify_llm
-from diagflow.core.tool import ToolRegistry
+from diagflow.core.validator import ConclusionValidator
 from diagflow.simulated.cluster import SimulatedCluster
 from diagflow.simulated.scenarios import ALL_SCENARIOS
-from diagflow.tools.registry import build_tool_registry
+from diagflow.tools.v3tools import build_v3_tools
 from diagflow.observability.report import render_report
 
 
@@ -77,12 +74,10 @@ class ConversationManager:
     """Manages a multi-turn diagnostic conversation."""
 
     def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_API_KEY")
-        self.llm: LLMClient | None = None
-        if self.api_key:
-            self.llm = LLMClient(api_keys=[self.api_key])
+        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_API_KEY") or ""
         self.state = ConversationState()
         self._diagnosis_result: str | None = None
+        self._agent: DiagAgent | None = None
 
     def handle_message(self, message: str) -> str:
         """Process a user message and return a response.
@@ -227,11 +222,10 @@ class ConversationManager:
         if self.state.job_id:
             context["job_id"] = self.state.job_id
 
-        tool_registry = build_tool_registry(cluster)
         evidence_pool = EvidencePool()
 
-        if self.llm:
-            return self._run_llm_diagnosis(s, context, cluster, tool_registry, evidence_pool)
+        if self.api_key:
+            return self._run_llm_diagnosis(s, context, cluster, {}, evidence_pool)
         else:
             return self._run_mock_diagnosis(s, context, cluster)
 
@@ -259,7 +253,7 @@ class ConversationManager:
             "",
         ]
 
-        if not self.llm:
+        if not self.api_key:
             lines.append("⚠️ 生产模式需要 DEEPSEEK_API_KEY 才能运行 LLM 诊断。")
             self.state.status = "complete"
             return "\n".join(lines)
@@ -281,30 +275,21 @@ class ConversationManager:
             cluster = RealCluster(instance_id, node_client=node_client, discovery=discovery)
             await cluster._ensure_node_data()
 
-            tool_registry = build_tool_registry(cluster)
-            verify_llm = make_default_verify_llm(self.llm)
-            topology = _load_topology(component=cluster.context.get("component", "flink"))
-            agent = Agent(
-                llm=self.llm,
-                tool_registry=tool_registry,
-                max_steps=12,
-                on_step=lambda m: print(f"  🔄 {m}"),
-                topology=topology,
-            )
-            validator = ConclusionValidator(self.llm, verify_llm)
-            engine = DiagnosisEngine(
-                llm=self.llm,
-                tool_registry=tool_registry,
-                agent=agent,
-                validator=validator,
+            from diagflow.tools.v3tools import build_v3_tools
+            tools = build_v3_tools(cluster)
+            agent = DiagAgent(
+                api_key=self.api_key,
+                model="deepseek-v4-flash",
                 strategies_dir=os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     "data", "strategies",
                 ),
+                validator=ConclusionValidator.standalone(self.api_key),
                 on_event=lambda m: print(f"  📋 {m}"),
             )
+            agent.register_tools(tools)
 
-            return await engine.diagnose(
+            return await agent.diagnose(
                 component=cluster.context.get("component", "flink"),
                 problem_type=cluster.context.get("problem", "unknown"),
                 context=cluster.context,
@@ -350,49 +335,36 @@ class ConversationManager:
         return self._diagnosis_result
 
     def _run_llm_diagnosis(self, scenario: str, context: dict, cluster,
-                           tool_registry: ToolRegistry, evidence_pool: EvidencePool) -> str:
-        """Run full LLM-powered diagnosis via DiagnosisEngine (v2 architecture)."""
+                           tool_registry, evidence_pool: EvidencePool) -> str:
+        """v3: DiagAgent (Anthropic SDK-powered ReAct + Strategy)."""
         import asyncio
+        from diagflow.tools.v3tools import build_v3_tools
+        from diagflow.core.validator import ConclusionValidator
         import os
 
         async def _run():
-            verify_llm = make_default_verify_llm(self.llm)
-            topology = _load_topology(component=context.get("component", "flink"))
-            agent = Agent(
-                llm=self.llm,
-                tool_registry=tool_registry,
-                max_steps=12,
-                on_step=lambda m: print(f"  🔄 {m}"),
-                topology=topology,
-            )
-            validator = ConclusionValidator(self.llm, verify_llm)
-            engine = DiagnosisEngine(
-                llm=self.llm,
-                tool_registry=tool_registry,
-                agent=agent,
-                validator=validator,
+            tools = build_v3_tools(cluster)
+            agent = DiagAgent(
+                api_key=self.api_key,
+                model="deepseek-v4-flash",
                 strategies_dir=os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     "data", "strategies",
                 ),
+                validator=ConclusionValidator.standalone(self.api_key) if self.api_key else None,
                 on_event=lambda m: print(f"  📋 {m}"),
             )
-
-            return await engine.diagnose(
+            agent.register_tools(tools)
+            return await agent.diagnose(
                 component=context.get("component", "flink"),
                 problem_type=context.get("problem", "unknown"),
                 context=context,
             )
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         report = loop.run_until_complete(_run())
         self.state.report = report
-
         result = render_report(report)
         self.state.status = "complete"
         self._diagnosis_result = result
@@ -430,7 +402,7 @@ class ConversationManager:
             return "好的，请描述新的问题。"
 
         # Default: use LLM to answer the follow-up
-        if self.llm and self._diagnosis_result:
+        if self.api_key and self._diagnosis_result:
             import asyncio
             prompt = f"""Previous diagnosis:
 {self._diagnosis_result[:2000]}
@@ -438,18 +410,21 @@ class ConversationManager:
 User follow-up question: {message}
 
 Answer the question based on the diagnosis context above."""
+            import asyncio
+            async def _ask():
+                from anthropic import Anthropic
+                c = Anthropic(api_key=self.api_key, base_url="https://api.modelverse.cn")
+                resp = c.messages.create(
+                    model="deepseek-v4-flash", max_tokens=512, temperature=0.3,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return "\n".join(b.text for b in resp.content if b.type == "text")
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-            response = loop.run_until_complete(
-                self.llm.generate(
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                )
-            )
-            return response.content or "抱歉，我无法回答这个问题。"
+            return loop.run_until_complete(_ask()) or "抱歉，我无法回答这个问题。"
         return (
             "您可以追问:\n"
             "- 根因是什么？\n"

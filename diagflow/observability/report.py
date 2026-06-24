@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from diagflow.core.engine import DiagnosisReport
+from diagflow.core.diag_agent import DiagnosisReport
 
 
 def render_report(report: DiagnosisReport) -> str:

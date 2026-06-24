@@ -5,7 +5,7 @@ description = "AI-Powered Diagnostic Agent for Big Data Platforms"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=1.0.0",       # DeepSeek/OpenAI-compatible chat + embeddings
+    "anthropic>=0.45.0",   # Anthropic SDK — via modelverse proxy → DeepSeek
     "chromadb>=0.5.0",
     "pyyaml>=6.0",
     "rich>=13.0",           # for CLI output
