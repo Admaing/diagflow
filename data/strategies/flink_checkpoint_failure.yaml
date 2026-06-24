@@ -1,0 +1,43 @@
+component: flink
+problem_type: checkpoint_failure
+version: ">=1.14"
+
+steps:
+  - action: fingerprint_match
+    description: "Check known Flink checkpoint issues"
+    priority: 0
+
+  - action: tool_call
+    tool: query_node_log
+    description: "Scan TaskManager log for checkpoint failures"
+    params:
+      log_path: "taskmanager-1.log"
+      keywords: "Checkpoint,checkpoint,expired,FAILED,barrier,alignment"
+    priority: 1
+
+  - action: tool_call
+    tool: query_metrics
+    description: "Check checkpoint and backpressure metrics"
+    params:
+      metric_types: "checkpoint_failure_rate,backpressure_level,input_rate_mbps,gc_pause_ms_avg"
+    priority: 2
+
+  - action: tool_call
+    tool: read_config
+    description: "Review Flink checkpoint config"
+    params:
+      config_path: "flink-conf.yaml"
+    priority: 3
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+
+validation:
+  required_evidence_sources: ["log", "metrics"]
+  min_evidence_count: 2
+
+output:
+  suggestions_min: 2
+  suggestions_max: 4

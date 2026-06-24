@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Deploy — 含公司内网配置, 不上传
+deploy/
+
+# Data — 种子案例可上传, ChromaDB 数据不上传
+data/cases/
+# data/strategies/     ← 可上传 (通用策略)
+# data/service_topology.yaml  ← 可上传 (通用拓扑)
+
+# Archive
+*.tar.gz
+*.zip
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# ChromaDB
+/tmp/diagflow/
+/chroma-data/

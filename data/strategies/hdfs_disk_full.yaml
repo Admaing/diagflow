@@ -1,0 +1,44 @@
+component: hdfs
+problem_type: disk_full
+version: ">=3.3"
+
+steps:
+  - action: fingerprint_match
+    description: "Check known HDFS disk issues"
+    priority: 0
+
+  - action: tool_call
+    tool: query_node_log
+    description: "Scan DataNode log for disk errors"
+    params:
+      log_path: "datanode-003.log"
+      keywords: "NoSpaceLeft,disk full,FAILED,out of space"
+    priority: 1
+
+  - action: tool_call
+    tool: query_metrics
+    description: "Check disk usage metrics"
+    params:
+      metric_types: "data1_usage_pct,data2_usage_pct,data3_usage_pct,block_repair_failures"
+    priority: 2
+
+  - action: tool_call
+    tool: read_config
+    description: "Review HDFS disk config"
+    params:
+      config_path: "hdfs-site.xml"
+    priority: 3
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+  fusion: rrf
+
+validation:
+  required_evidence_sources: ["log", "metrics"]
+  min_evidence_count: 2
+
+output:
+  suggestions_min: 2
+  suggestions_max: 4

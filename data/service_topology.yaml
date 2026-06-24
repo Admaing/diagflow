@@ -1,0 +1,88 @@
+# 大数据组件部署拓扑
+# 每个组件的各个子服务分布在哪些节点角色上，日志路径是什么
+# Agent 拿到这个文件后不用盲目探索，直接去正确的节点查日志
+#
+# ⚠️ Flink/Spark on YARN 的特殊流程:
+#   TaskManager 容器可以在任意 core/task 节点上，不是固定拓扑。
+#   诊断时必须: GetYarnAppNodes(master1) → 找到具体节点 → GetLogs(那些节点)
+
+flink:
+  JobManager:
+    node_role: master
+    log_paths:
+      - /var/log/flink/flink-standalonesession-*.log
+      - /var/log/flink/flink-standalonesession-*.out
+    process_name: StandaloneSessionClusterEntrypoint
+    config_path: /usr/local/service/flink/conf/flink-conf.yaml
+  TaskManager:
+    node_role: core
+    log_paths:
+      - /var/log/flink/flink-taskmanager-*.log
+      - /var/log/flink/flink-taskmanager-*.out
+    process_name: TaskManagerRunner
+    config_path: /usr/local/service/flink/conf/flink-conf.yaml
+
+hdfs:
+  NameNode:
+    node_role: master
+    log_paths:
+      - /var/log/hadoop/hdfs/hadoop-hdfs-namenode-*.log
+    process_name: NameNode
+    config_path: /usr/local/service/hadoop/etc/hadoop/hdfs-site.xml
+  DataNode:
+    node_role: core
+    log_paths:
+      - /var/log/hadoop/hdfs/hadoop-hdfs-datanode-*.log
+    process_name: DataNode
+    config_path: /usr/local/service/hadoop/etc/hadoop/hdfs-site.xml
+  JournalNode:
+    node_role: master
+    log_paths:
+      - /var/log/hadoop/hdfs/hadoop-hdfs-journalnode-*.log
+    process_name: JournalNode
+
+yarn:
+  ResourceManager:
+    node_role: master
+    log_paths:
+      - /var/log/hadoop/yarn/yarn-yarn-resourcemanager-*.log
+    process_name: ResourceManager
+    config_path: /usr/local/service/hadoop/etc/hadoop/yarn-site.xml
+  NodeManager:
+    node_role: core
+    log_paths:
+      - /var/log/hadoop/yarn/yarn-yarn-nodemanager-*.log
+    process_name: NodeManager
+
+kafka:
+  Broker:
+    node_role: core
+    log_paths:
+      - /var/log/kafka/server.log
+    process_name: Kafka
+
+hbase:
+  HMaster:
+    node_role: master
+    log_paths:
+      - /var/log/hbase/hbase-hbase-master-*.log
+    process_name: HMaster
+  RegionServer:
+    node_role: core
+    log_paths:
+      - /var/log/hbase/hbase-hbase-regionserver-*.log
+    process_name: RegionServer
+
+spark:
+  SparkSubmit:
+    node_role: master
+    log_paths:
+      - /var/log/spark/*
+    process_name: SparkSubmit
+
+zookeeper:
+  QuorumPeer:
+    node_role: master
+    log_paths:
+      - /var/log/zookeeper/zookeeper.out
+    process_name: QuorumPeerMain

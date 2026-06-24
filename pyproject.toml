@@ -1,0 +1,34 @@
+[project]
+name = "diagflow"
+version = "0.1.0"
+description = "AI-Powered Diagnostic Agent for Big Data Platforms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",       # DeepSeek/OpenAI-compatible chat + embeddings
+    "chromadb>=0.5.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",           # for CLI output
+    "rank-bm25>=0.2.0",     # for BM25 retrieval
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "streamlit>=1.30",
+    "kazoo>=2.9",
+    "aiomysql>=0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.0",
+    "ruff>=0.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

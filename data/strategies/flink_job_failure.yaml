@@ -1,0 +1,65 @@
+# Flink 任务失败诊断策略 — 生产模式
+#
+# Phase 2 只做"确定性该做"的事情：指纹检查 + 进程检查 + YARN 查询。
+# 日志路径因集群而异（不同部署、不同版本路径不同），
+# 交给 Phase 3 Agent 用 ssh_exec find 动态发现。
+
+component: flink
+problem_type: job_failure
+version: ">=1.14"
+
+steps:
+  - action: fingerprint_match
+    description: "Check known issues first"
+    priority: 0
+
+  - action: tool_call
+    tool: query_yarn
+    description: "Check YARN for failed Flink apps"
+    params:
+      action: "list_apps"
+      app_name: "RUNNING,FAILED,KILLED,FINISHED"
+    priority: 1
+
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Check if JobManager process runs on master1"
+    params:
+      node_name: "master1"
+      action: "CheckProcess"
+      params:
+        ProcessName: "StandaloneSessionClusterEntrypoint"
+    priority: 1
+
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Check if TaskManager process runs on core1"
+    params:
+      node_name: "core1"
+      action: "CheckProcess"
+      params:
+        ProcessName: "TaskManagerRunner"
+    priority: 1
+
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Get base info from master1"
+    params:
+      node_name: "master1"
+      action: "GetBaseInfo"
+    priority: 2
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+  fusion: rrf
+
+validation:
+  required_evidence_sources: ["log", "metrics"]
+  min_evidence_count: 3
+  cross_source_check: true
+
+output:
+  suggestions_min: 2
+  suggestions_max: 5

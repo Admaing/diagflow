@@ -1,0 +1,33 @@
+component: flink
+description: "Default Flink diagnosis strategy — for job failures, checkpoint issues, and OOM"
+steps:
+  - phase: "fingerprint"
+    action: fingerprint_match
+    description: "Check if error pattern matches known Flink issues"
+    params: { component: "flink" }
+
+  - phase: "parallel_collection"
+    agents:
+      - name: "log_analyst"
+        tools: ["query_node_log"]
+        description: "Examine TaskManager and JobManager logs for errors"
+      - name: "metrics_analyst"
+        tools: ["query_metrics"]
+        description: "Check heap usage, GC pauses, checkpoint stats"
+      - name: "config_analyst"
+        tools: ["read_config"]
+        description: "Review Flink and YARN configuration"
+
+  - phase: "synthesis"
+    action: supervisor_synthesis
+    description: "Cross-reference all evidence and produce diagnosis"
+
+investigation_guide: |
+  For Flink job failures, the diagnostic flow is:
+  1. Check if this is a known issue (fingerprint_match)
+  2. Read JobManager log for job lifecycle events
+  3. Read TaskManager logs for ERROR/WARN with focus on OOM, GC, checkpoint
+  4. Query Flink REST API for job status, checkpoint stats, backpressure
+  5. Review flink-conf.yaml for heap size, parallelism, checkpoint interval
+  6. Cross-reference: do log errors match metrics anomalies?
+  7. Produce finding with root cause, evidence, and actionable suggestions

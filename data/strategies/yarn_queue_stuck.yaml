@@ -1,0 +1,43 @@
+component: yarn
+problem_type: queue_stuck
+version: ">=3.3"
+
+steps:
+  - action: fingerprint_match
+    description: "Check known YARN queue issues"
+    priority: 0
+
+  - action: tool_call
+    tool: query_node_log
+    description: "Scan ResourceManager log for queue issues"
+    params:
+      log_path: "resourcemanager.log"
+      keywords: "capacity,pending,denied,maxCapacity,ACCEPTED"
+    priority: 1
+
+  - action: tool_call
+    tool: query_metrics
+    description: "Check cluster resource metrics"
+    params:
+      metric_types: "cluster_memory_used_gb,cluster_memory_total_gb,cluster_vcores_used,cluster_vcores_total,pending_apps,queue_production_used_pct"
+    priority: 2
+
+  - action: tool_call
+    tool: read_config
+    description: "Review YARN scheduler config"
+    params:
+      config_path: "yarn-site.xml"
+    priority: 3
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+
+validation:
+  required_evidence_sources: ["log", "metrics"]
+  min_evidence_count: 2
+
+output:
+  suggestions_min: 2
+  suggestions_max: 4
