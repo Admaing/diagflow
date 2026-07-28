@@ -1,8 +1,11 @@
 """
-Vector store abstraction — wraps ChromaDB for local embedding storage.
+Vector store abstraction — ChromaDB or Milvus Lite.
 
-Used by the RAG system to store and retrieve historical diagnosis cases.
-ChromaDB is chosen for zero-config local operation (no external server needed).
+Set ``DIAGFLOW_VECTOR_STORE__BACKEND=milvus`` to use Milvus Lite (embedded,
+no server needed). Defaults to ChromaDB.
+
+The ``VectorStore`` class is a factory — upstream code doesn't know
+which backend is active.
 """
 
 from __future__ import annotations
@@ -11,19 +14,53 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import chromadb
-from chromadb.config import Settings
-
 logger = logging.getLogger(__name__)
 
 
-class VectorStore:
-    """ChromaDB-backed vector store for diagnosis cases."""
+# ============================================================================
+# Factory
+# ============================================================================
 
-    def __init__(self, persist_dir: str = "") -> None:
+
+class VectorStore:
+    """Unified vector store — picks ChromaDB or Milvus based on config."""
+
+    def __new__(cls, persist_dir: str = "", **kwargs):
+        from diagflow.config import get_config
+
+        cfg = get_config()
+        backend = cfg.vector_store.backend
+        if backend == "milvus":
+            try:
+                return _MilvusVectorStore(**kwargs)
+            except Exception:
+                logger.warning(
+                    "Milvus init failed — pymilvus not installed or unreachable. "
+                    "Falling back to ChromaDB.",
+                    exc_info=True,
+                )
+        if backend == "chromadb" or backend == "milvus":
+            return _ChromaVectorStore(persist_dir=persist_dir, **kwargs)
+
+        logger.warning("Unknown vector store backend '%s', falling back to ChromaDB", backend)
+        return _ChromaVectorStore(persist_dir=persist_dir, **kwargs)
+
+
+# ============================================================================
+# ChromaDB backend
+# ============================================================================
+
+
+class _ChromaVectorStore:
+    """ChromaDB-backed vector store."""
+
+    def __init__(self, persist_dir: str = "", **kwargs) -> None:
+        import chromadb
+        from chromadb.config import Settings
+
         from diagflow.config import get_config
         cfg = get_config()
-        self.persist_dir = Path(persist_dir or cfg.vector_store.persist_dir)
+        self.persist_dir = Path(persist_dir or cfg.vector_store.chroma_persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         self._collection_name = cfg.vector_store.collection_name
         self.client = chromadb.PersistentClient(
@@ -41,14 +78,8 @@ class VectorStore:
             )
         return self._collection
 
-    def add_case(
-        self,
-        case_id: str,
-        text: str,
-        metadata: dict[str, Any],
-        embedding: list[float],
-    ) -> None:
-        """Store or update a case with its embedding (idempotent upsert)."""
+    def add_case(self, case_id: str, text: str, metadata: dict[str, Any],
+                 embedding: list[float]) -> None:
         try:
             self.collection.upsert(
                 ids=[case_id],
@@ -59,12 +90,7 @@ class VectorStore:
         except Exception:
             logger.warning("ChromaDB upsert failed for %s", case_id, exc_info=True)
 
-    def search(
-        self,
-        query_embedding: list[float],
-        n_results: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Search for similar cases by embedding. Returns empty list on error."""
+    def search(self, query_embedding: list[float], n_results: int = 5) -> list[dict[str, Any]]:
         try:
             results = self.collection.query(
                 query_embeddings=[query_embedding],
@@ -99,9 +125,166 @@ class VectorStore:
             return 0
 
     def close(self) -> None:
-        """Release ChromaDB resources."""
         try:
-            # PersistentClient doesn't need explicit close, but clear refs
             self._collection = None
         except Exception:
             pass
+
+
+# ============================================================================
+# Milvus backend (lazy import — pymilvus only loaded when selected)
+# ============================================================================
+
+
+class _MilvusVectorStore:
+    """Milvus Lite / Standalone vector store.
+
+    Uses MilvusClient (pymilvus). Milvus Lite: file-based, zero deps beyond pip.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        from diagflow.config import get_config
+        cfg = get_config()
+        self._collection_name = cfg.vector_store.collection_name
+        self._dim = cfg.vector_store.embedding_dim
+        self._db_path = cfg.vector_store.milvus_db_path
+
+        import pymilvus
+        self._client = pymilvus.MilvusClient(self._db_path)
+        self._adapter = _MilvusAdapter(self._client, self._collection_name)
+        self._ensure_collection()
+
+    def _ensure_collection(self) -> None:
+        try:
+            if self._client.has_collection(self._collection_name):
+                self._client.load_collection(self._collection_name)
+                return
+            self._client.create_collection(
+                collection_name=self._collection_name,
+                dimension=self._dim,
+                metric_type="COSINE",
+                auto_id=False,
+                enable_dynamic_field=True,
+            )
+            # Create index for fast search
+            self._client.create_index(
+                collection_name=self._collection_name,
+                field_name="vector",
+                index_type="IVF_FLAT",
+                metric_type="COSINE",
+                params={"nlist": 128},
+            )
+            logger.info("Milvus collection created: %s (dim=%d)", self._collection_name, self._dim)
+        except Exception:
+            logger.warning("Milvus collection init failed", exc_info=True)
+
+    @property
+    def collection(self):
+        """Return adapter for collection.get() / .delete() compatibility."""
+        return self._adapter
+
+    def add_case(self, case_id: str, text: str, metadata: dict[str, Any],
+                 embedding: list[float]) -> None:
+        """Store or update (upsert) a case."""
+        try:
+            self._client.upsert(
+                collection_name=self._collection_name,
+                data=[{
+                    "id": case_id,
+                    "vector": embedding,
+                    "text": text,
+                    **{k: str(v)[:512] if v is not None else ""
+                       for k, v in metadata.items()},
+                }],
+            )
+        except Exception:
+            logger.warning("Milvus upsert failed for %s", case_id, exc_info=True)
+
+    def search(self, query_embedding: list[float], n_results: int = 5) -> list[dict[str, Any]]:
+        """Search by embedding. Returns list of {id, document, metadata, distance}."""
+        try:
+            results = self._client.search(
+                collection_name=self._collection_name,
+                data=[query_embedding],
+                limit=n_results,
+                output_fields=["text", "id"],
+            )
+        except Exception:
+            logger.warning("Milvus search failed", exc_info=True)
+            return []
+
+        items: list[dict[str, Any]] = []
+        for hit in (results[0] if results else []):
+            entity = hit.get("entity", {}) or hit
+            items.append({
+                "id": entity.get("id", ""),
+                "document": entity.get("text", ""),
+                "metadata": {
+                    k: v for k, v in entity.items()
+                    if k not in ("id", "vector", "text")
+                },
+                "distance": hit.get("distance", 1.0),
+            })
+        return items
+
+    def count(self) -> int:
+        try:
+            stats = self._client.get_collection_stats(self._collection_name)
+            return stats.get("row_count", 0)
+        except Exception:
+            logger.warning("Milvus count failed", exc_info=True)
+            return 0
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+class _MilvusAdapter:
+    """Provides collection.get() and collection.delete() — ChromaDB API compatible."""
+
+    def __init__(self, client, collection_name: str):
+        self._client = client
+        self._name = collection_name
+
+    def get(self, include: list[str] | None = None):
+        """Fetch all entities, formatted like ChromaDB's collection.get()."""
+        include = include or ["documents", "metadatas"]
+        try:
+            # Query all with a tautology expression
+            results = self._client.query(
+                collection_name=self._name,
+                filter="id != ''",
+                output_fields=["id", "text"],
+                limit=10000,
+            )
+        except Exception:
+            logger.warning("Milvus get_all failed", exc_info=True)
+            return {"ids": [], "documents": [], "metadatas": []}
+
+        ids = [r["id"] for r in results]
+        docs = []
+        metas = []
+        for r in results:
+            docs.append(r.get("text", ""))
+            metas.append({
+                k: v for k, v in r.items()
+                if k not in ("id", "vector", "text")
+            })
+        out: dict[str, Any] = {"ids": ids}
+        if "documents" in include:
+            out["documents"] = docs
+        if "metadatas" in include:
+            out["metadatas"] = metas
+        return out
+
+    def delete(self, ids: list[str]) -> None:
+        try:
+            self._client.delete(
+                collection_name=self._name,
+                ids=ids,
+            )
+        except Exception:
+            logger.warning("Milvus delete failed", exc_info=True)
