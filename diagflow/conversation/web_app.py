@@ -2,7 +2,7 @@
 Streamlit web chat interface for DiagFlow v3 — DiagAgent powered.
 """
 
-import os, sys, queue, threading, asyncio
+import os, sys, queue, threading, asyncio, logging
 
 import streamlit as st
 
@@ -16,9 +16,29 @@ from diagflow.tools.v3tools import build_v3_tools
 from diagflow.observability.report import render_report
 from diagflow.infra import RealCluster, UCloudServiceDiscovery, NodeInfoClient
 
+logger = logging.getLogger(__name__)
+
 
 def init_session():
     api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_API_KEY") or ""
+    auth_token = os.environ.get("DIAGFLOW_AUTH_TOKEN", "")
+
+    # Auth gate (Phase 3.3)
+    if auth_token:
+        if "authenticated" not in st.session_state:
+            st.session_state.authenticated = False
+        if not st.session_state.authenticated:
+            with st.sidebar:
+                st.title("🩺 DiagFlow v3")
+                token_input = st.text_input("Access Token", type="password")
+                if st.button("登录"):
+                    if token_input == auth_token:
+                        st.session_state.authenticated = True
+                        st.rerun()
+                    else:
+                        st.error("Token 错误")
+            st.stop()
+
     if "manager" not in st.session_state:
         st.session_state.api_key = api_key
         st.session_state.event_queue = queue.Queue()
@@ -36,9 +56,6 @@ def init_session():
 
 
 def _run_thread(scenario, cluster_id, api_key, event_queue):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     def on_event(msg):
         event_queue.put(("step", msg))
 
@@ -52,17 +69,19 @@ def _run_thread(scenario, cluster_id, api_key, event_queue):
             return f"## 🔍 Demo: {scenario}\n\n**预期根因**: {c.expected_root_cause}\n\n> 设置 DEEPSEEK_API_KEY 启用 LLM"
 
     try:
-        result = loop.run_until_complete(_go())
+        result = asyncio.run(_go())
         event_queue.put(("result", result))
     except Exception as e:
         event_queue.put(("error", str(e)))
 
 
 async def _demo_llm_run(scenario, api_key, on_event):
+    from diagflow.config import get_config
+    cfg = get_config()
     c = SimulatedCluster(scenario)
     tools = build_v3_tools(c)
     agent = DiagAgent(
-        api_key=api_key, model="deepseek-v4-flash",
+        api_key=api_key,
         strategies_dir=os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "data", "strategies",
@@ -87,7 +106,7 @@ async def _prod_run(cluster_id, api_key, on_event):
     await cluster._ensure_node_data()
     tools = build_v3_tools(cluster)
     agent = DiagAgent(
-        api_key=api_key, model="deepseek-v4-flash",
+        api_key=api_key,
         strategies_dir=os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "data", "strategies",

@@ -11,7 +11,9 @@ Handles the full lifecycle of a user-facing diagnostic conversation:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -24,6 +26,8 @@ from diagflow.simulated.cluster import SimulatedCluster
 from diagflow.simulated.scenarios import ALL_SCENARIOS
 from diagflow.tools.v3tools import build_v3_tools
 from diagflow.observability.report import render_report
+
+logger = logging.getLogger(__name__)
 
 
 # Known runnable scenarios for demo
@@ -91,8 +95,10 @@ class ConversationManager:
             if cases_dir.exists():
                 count = self._kb.load_cases_from_dir(str(cases_dir))
                 if count:
-                    print(f"  📚 KB loaded: {count} cases, {len(self._kb._fingerprints)} fingerprints")
+                    logger.info("KB loaded: %d cases, %d fingerprints",
+                               count, len(self._kb._fingerprints))
         except Exception:
+            logger.warning("Failed to initialize knowledge base", exc_info=True)
             self._kb = None
 
     def handle_message(self, message: str) -> str:
@@ -275,11 +281,6 @@ class ConversationManager:
             return "\n".join(lines)
 
         import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
 
         async def _build_and_diagnose():
             discovery = UCloudServiceDiscovery.from_env()
@@ -313,7 +314,7 @@ class ConversationManager:
             )
 
         try:
-            report = loop.run_until_complete(_build_and_diagnose())
+            report = asyncio.run(_build_and_diagnose())
             self.state.report = report
             result = render_report(report)
             self.state.status = "complete"
@@ -363,7 +364,6 @@ class ConversationManager:
             tools = build_v3_tools(cluster)
             agent = DiagAgent(
                 api_key=self.api_key,
-                model="deepseek-v4-flash",
                 strategies_dir=os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     "data", "strategies",
@@ -379,9 +379,7 @@ class ConversationManager:
                 context=context,
             )
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        report = loop.run_until_complete(_run())
+        report = asyncio.run(_run())
         self.state.report = report
         result = render_report(report)
         self.state.status = "complete"
@@ -421,7 +419,8 @@ class ConversationManager:
 
         # Default: use LLM to answer the follow-up
         if self.api_key and self._diagnosis_result:
-            import asyncio
+            from diagflow.config import get_config
+            cfg = get_config()
             prompt = f"""Previous diagnosis:
 {self._diagnosis_result[:2000]}
 
@@ -431,18 +430,13 @@ Answer the question based on the diagnosis context above."""
             import asyncio
             async def _ask():
                 from anthropic import Anthropic
-                c = Anthropic(api_key=self.api_key, base_url="https://api.modelverse.cn")
+                c = Anthropic(api_key=self.api_key, base_url=cfg.llm.base_url)
                 resp = c.messages.create(
-                    model="deepseek-v4-flash", max_tokens=512, temperature=0.3,
+                    model=cfg.llm.model, max_tokens=512, temperature=0.3,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 return "\n".join(b.text for b in resp.content if b.type == "text")
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            return loop.run_until_complete(_ask()) or "抱歉，我无法回答这个问题。"
+            return asyncio.run(_ask()) or "抱歉，我无法回答这个问题。"
         return (
             "您可以追问:\n"
             "- 根因是什么？\n"

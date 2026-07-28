@@ -22,12 +22,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from typing import Any
 
 import httpx
 from kazoo.client import KazooClient
+
+logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -78,7 +81,7 @@ class UCloudServiceDiscovery:
                 try:
                     instances.append(json.loads(data))
                 except Exception:
-                    pass
+                    logger.debug("Failed to parse ZK node data", exc_info=True)
         self._cache[zk_path] = instances
 
     # -- Consul leader discovery (mirrors uhadoop-go's LeaderDiscovery) --
@@ -130,8 +133,6 @@ class UmrAgentClient:
     come from the API response, not from our own DB query.
     """
 
-    UMRAGENT_PORT = 65431   # from pkg/client/uagent/model.go line 14
-
     def __init__(self, timeout_s: int = 10):
         self._client = httpx.AsyncClient(timeout=timeout_s)
 
@@ -146,15 +147,10 @@ class UmrAgentClient:
         params: dict | None = None,
         method: str = "GET",
     ) -> str:
-        """Invoke an umrAgent Action on a node.
+        """Invoke an umrAgent Action on a node."""
+        from diagflow.config import get_config
+        cfg = get_config()
 
-        Args:
-            ipv6: Node's IPv6 address (from Go node-info API)
-            agent_key: umr_agent_key (from Go node-info API)
-            action: The umrAgent Action, e.g. "GetLogs", "GetAppList"
-            params: Additional query parameters
-            method: HTTP verb
-        """
         all_params: dict[str, str] = {
             "Action": action,
             "Date": str(int(time.time() * 1000)),
@@ -167,7 +163,7 @@ class UmrAgentClient:
         all_params["Signature"] = signature
 
         query = "&".join(f"{k}={v}" for k, v in all_params.items())
-        url = f"http://[{ipv6}]:{self.UMRAGENT_PORT}/?{query}"
+        url = f"http://[{ipv6}]:{cfg.umr_agent.port}/?{query}"
 
         if method == "GET":
             resp = await self._client.get(url)
@@ -290,7 +286,7 @@ class NodeInfoClient:
                         base = f"http://{svc['ip']}:{svc.get('port', 20141)}"
                         return cls(base_url=base, region=region)
         except Exception:
-            pass
+            logger.warning("ZK set scan failed, trying env var fallback", exc_info=True)
 
         # Strategy 3: env var fallback
         base = os.environ.get("UHADOOP_MANAGE_HTTP_BASE", "")
@@ -372,6 +368,7 @@ class RealCluster:
             with open(topo_path) as f:
                 full_topo = yaml.safe_load(f) or {}
         except Exception:
+            logger.warning("Failed to load service topology", exc_info=True)
             return
 
         apps = cluster_info.get("app", [])

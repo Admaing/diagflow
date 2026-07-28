@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,8 @@ from typing import Any
 from .embedder import Embedder
 from .retriever import HybridRetriever
 from .vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeBase:
@@ -36,6 +39,35 @@ class KnowledgeBase:
         self.retriever = HybridRetriever(self.vector_store, self.embedder)
         # {md5_hash: KnownCase}
         self._fingerprints: dict[str, dict[str, Any]] = {}
+        # Restore fingerprints from persisted ChromaDB metadata
+        self._load_fingerprints()
+
+    # ------------------------------------------------------------------
+    # Fingerprint persistence
+    # ------------------------------------------------------------------
+
+    def _load_fingerprints(self) -> None:
+        """Rebuild in-memory fingerprint dict from ChromaDB metadata."""
+        try:
+            all_cases = self.vector_store.collection.get(
+                include=["metadatas"]
+            )
+            if all_cases and all_cases.get("metadatas"):
+                for i, meta in enumerate(all_cases["metadatas"]):
+                    fp = meta.get("fingerprint", "")
+                    if fp and fp not in self._fingerprints:
+                        self._fingerprints[fp] = {
+                            "case_id": all_cases["ids"][i] if all_cases.get("ids") else fp,
+                            "component": meta.get("component", "unknown"),
+                            "error_pattern": meta.get("error_pattern", "unknown"),
+                            "version": meta.get("version", ""),
+                            "root_cause": meta.get("root_cause", ""),
+                            "suggestions": meta.get("suggestions", "").split(",") if isinstance(meta.get("suggestions"), str) else meta.get("suggestions", []),
+                            "_hits": meta.get("_hits", 0),
+                        }
+                logger.info("Loaded %d fingerprints from ChromaDB", len(self._fingerprints))
+        except Exception:
+            logger.warning("Failed to load fingerprints from ChromaDB", exc_info=True)
 
     # ------------------------------------------------------------------
     # Fingerprint — fast-path (Phase 1, zero LLM)
@@ -50,12 +82,16 @@ class KnowledgeBase:
     def fingerprint_match(
         self, component: str, error_pattern: str, version: str = ""
     ) -> dict | None:
-        """Phase 1 fast-path: exact MD5 match. Returns cached case or None."""
+        """Phase 1 fast-path: exact MD5 match. Returns cached case or None.
+
+        Skips disputed cases (marked via mark_incorrect).
+        """
         fp = self.make_fingerprint(component, error_pattern, version)
         match = self._fingerprints.get(fp)
-        if match:
+        if match and not match.get("_disputed"):
             match["_hits"] = match.get("_hits", 0) + 1
-        return match
+            return match
+        return None
 
     # ------------------------------------------------------------------
     # Indexing — auto-inserted after each successful diagnosis
@@ -204,7 +240,7 @@ class KnowledgeBase:
                 self.add_case_from_md(str(f))
                 count += 1
             except Exception as exc:
-                print(f"  ⚠️  Failed to load {f}: {exc}")
+                logger.warning("Failed to load case %s: %s", f, exc)
         self._rebuild_bm25()
         return count
 
@@ -215,12 +251,9 @@ class KnowledgeBase:
     @staticmethod
     def _extract_error_pattern(text: str) -> str:
         """Extract key error keywords from text."""
-        keywords = [
-            "OutOfMemoryError", "OOM", "NoSpaceLeft", "disk full",
-            "CheckpointExpired", "checkpoint expired", "timeout",
-            "backpressure", "GC overhead", "Connection refused",
-            "NoRouteToHost", "FileNotFound", "Permission denied",
-        ]
+        from diagflow.config import get_config
+        cfg = get_config()
+        keywords = cfg.rag.error_keywords
         found = [k for k in keywords if k in text]
         return found[0] if found else text[:50].strip()
 
@@ -260,3 +293,9 @@ class KnowledgeBase:
             "fingerprint_cases": len(self._fingerprints),
             "chroma_docs": self.vector_store.count(),
         }
+
+    def mark_incorrect(self, fp: str) -> None:
+        """Mark a fingerprint as disputed — prevents future fast-path hits."""
+        if fp in self._fingerprints:
+            self._fingerprints[fp]["_disputed"] = True
+            logger.info("Marked fingerprint as disputed: %s", fp)

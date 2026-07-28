@@ -8,10 +8,13 @@ hash-based embedding for offline demo mode.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class Embedder:
@@ -37,6 +40,7 @@ class Embedder:
             resp = client.embeddings.create(model=self.model, input=text)
             return resp.data[0].embedding
         except Exception:
+            logger.warning("OpenAI embed failed, using fallback", exc_info=True)
             return self._fallback_embed(text)
 
     def _fallback_embed(self, text: str) -> list[float]:

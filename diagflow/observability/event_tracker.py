@@ -12,10 +12,13 @@ decisions reached. This is critical for:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class EventTracker:
@@ -26,6 +29,7 @@ class EventTracker:
         self.session_dir = Path(log_dir) / event_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._step_counter = 0
+        self._events_file = self.session_dir / "events.jsonl"
 
     def log(self, message: str) -> None:
         """Log a plain message (shown to user and saved to file)."""
@@ -36,7 +40,6 @@ class EventTracker:
         (self.session_dir / safe).write_text(
             f"[{timestamp}]\n{message}\n", encoding="utf-8"
         )
-        print(f"  🔍 {message}")
 
     def log_tool_call(self, tool_name: str, args: dict[str, Any], result: str) -> None:
         """Record a tool invocation."""
@@ -48,6 +51,25 @@ class EventTracker:
             f"Result:\n{result[:2000]}\n"
         )
         (self.session_dir / filename).write_text(content, encoding="utf-8")
+
+    def log_structured(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Emit a structured JSON Lines event for downstream analysis.
+
+        Event types: phase_started, phase_completed, tool_call_started,
+        tool_call_completed, tool_call_failed, evidence_added, kb_hit,
+        kb_miss, validation_passed, validation_failed.
+        """
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event_id": self.event_id,
+            "type": event_type,
+            **payload,
+        }
+        try:
+            with open(self._events_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            logger.warning("Failed to write structured event", exc_info=True)
 
     def summary(self) -> str:
         """List all logged steps."""

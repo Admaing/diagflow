@@ -13,9 +13,13 @@ Two complementary constructs:
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -60,36 +64,46 @@ class EvidencePool:
 
     def __init__(self) -> None:
         self._items: list[Evidence] = []
+        self._lock = threading.Lock()
 
     def add(self, evidence: Evidence) -> None:
-        self._items.append(evidence)
+        with self._lock:
+            self._items.append(evidence)
 
     def add_many(self, evidences: list[Evidence]) -> None:
-        self._items.extend(evidences)
+        with self._lock:
+            self._items.extend(evidences)
 
     def all(self) -> list[Evidence]:
-        return list(self._items)
+        with self._lock:
+            return list(self._items)
 
     def by_agent(self, agent_name: str) -> list[Evidence]:
-        return [e for e in self._items if e.source_agent == agent_name]
+        with self._lock:
+            return [e for e in self._items if e.source_agent == agent_name]
 
     def by_category(self, category: str) -> list[Evidence]:
-        return [e for e in self._items if e.category == category]
+        with self._lock:
+            return [e for e in self._items if e.category == category]
 
     def high_confidence(self, threshold: float = 0.7) -> list[Evidence]:
-        return [e for e in self._items if e.confidence >= threshold]
+        with self._lock:
+            return [e for e in self._items if e.confidence >= threshold]
 
     def summary(self) -> str:
         """Compact summary for inclusion in the LLM prompt."""
+        with self._lock:
+            items = list(self._items)
         lines = ["=== Evidence Pool ==="]
-        for e in self._items:
+        for e in items:
             lines.append(f"  {e.short_str()}")
-        if not self._items:
+        if not items:
             lines.append("  (no evidence collected yet)")
         return "\n".join(lines)
 
     def clear(self) -> None:
-        self._items.clear()
+        with self._lock:
+            self._items.clear()
 
 
 # ---------------------------------------------------------------------------
