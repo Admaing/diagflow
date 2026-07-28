@@ -78,6 +78,22 @@ class ConversationManager:
         self.state = ConversationState()
         self._diagnosis_result: str | None = None
         self._agent: DiagAgent | None = None
+        self._kb = None
+        self._init_kb()
+
+    def _init_kb(self):
+        """Initialize knowledge base with seed cases."""
+        try:
+            from diagflow.rag.knowledge_base import KnowledgeBase
+            from pathlib import Path
+            cases_dir = Path(__file__).parent.parent.parent / "data" / "cases"
+            self._kb = KnowledgeBase()
+            if cases_dir.exists():
+                count = self._kb.load_cases_from_dir(str(cases_dir))
+                if count:
+                    print(f"  📚 KB loaded: {count} cases, {len(self._kb._fingerprints)} fingerprints")
+        except Exception:
+            self._kb = None
 
     def handle_message(self, message: str) -> str:
         """Process a user message and return a response.
@@ -284,6 +300,7 @@ class ConversationManager:
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     "data", "strategies",
                 ),
+                knowledge_base=self._kb,
                 validator=ConclusionValidator.standalone(self.api_key),
                 on_event=lambda m: print(f"  📋 {m}"),
             )
@@ -351,6 +368,7 @@ class ConversationManager:
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     "data", "strategies",
                 ),
+                knowledge_base=self._kb,
                 validator=ConclusionValidator.standalone(self.api_key) if self.api_key else None,
                 on_event=lambda m: print(f"  📋 {m}"),
             )

@@ -358,6 +358,44 @@ class RealCluster:
             "problem": self.context.get("problem", "service_failure"),
             "nodes_count": len(self._nodes_list),
         })
+        # Auto-generate topology from installed components
+        self._load_topology(ci)
+
+    def _load_topology(self, cluster_info: dict) -> None:
+        """Load topology for this cluster from describe_cluster.app[] list."""
+        import yaml
+        from pathlib import Path
+        try:
+            topo_path = Path(__file__).parent.parent.parent / "data" / "service_topology.yaml"
+            if not topo_path.exists():
+                return
+            with open(topo_path) as f:
+                full_topo = yaml.safe_load(f) or {}
+        except Exception:
+            return
+
+        apps = cluster_info.get("app", [])
+        if not apps:
+            return
+
+        installed = set()
+        for a in apps:
+            name = (a.get("app_name", "") or a.get("name", "")).lower()
+            installed.add(name)
+        # Also infer from framework
+        framework = (cluster_info.get("framework", "") or "").lower()
+        if "hadoop" in framework:
+            installed.update({"hdfs", "yarn"})
+
+        # Filter topology to only installed components
+        cluster_topo = {}
+        for comp_name, comp_data in full_topo.items():
+            if comp_name in installed:
+                cluster_topo[comp_name] = comp_data
+
+        if cluster_topo:
+            self.context["topology"] = cluster_topo
+            self.context["installed_components"] = list(installed)
 
     def _find_node(self, node_ref: str) -> dict | None:
         """Resolve a node reference to a node entry.
