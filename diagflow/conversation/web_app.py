@@ -198,7 +198,44 @@ def _send_message(prompt: str):
         st.session_state.messages.append({"role": "assistant", "content": result_text, "event_steps": steps})
     else:
         st.session_state.messages.append({"role": "assistant", "content": "⚠️ 未返回结果", "event_steps": steps})
+
+    # Show feedback buttons after diagnosis result
+    if result_text and "event_id" not in st.session_state.get("last_diag", {}):
+        st.session_state.last_diag = {"shown": True}
     st.rerun()
+
+
+def _render_feedback(event_id: str):
+    """Render feedback buttons below a diagnosis report."""
+    import asyncio
+    if f"feedback_{event_id}" in st.session_state:
+        st.caption("✅ 感谢反馈")
+        return
+
+    col1, col2, _ = st.columns([1, 1, 4])
+    with col1:
+        if st.button("✅ 诊断正确", key=f"ok_{event_id}"):
+            st.session_state[f"feedback_{event_id}"] = True
+            _save_feedback(event_id, True)
+            st.rerun()
+    with col2:
+        if st.button("❌ 诊断错误", key=f"err_{event_id}"):
+            st.session_state[f"feedback_{event_id}"] = True
+            _save_feedback(event_id, False)
+            st.rerun()
+
+
+def _save_feedback(event_id: str, is_correct: bool):
+    """Write feedback to MySQL (non-blocking, best-effort)."""
+    try:
+        async def _go():
+            from diagflow.observability import db as _db
+            await _db.insert_feedback(event_id=event_id, is_correct=is_correct)
+            if not is_correct:
+                logger.info("Diagnosis %s marked incorrect by user", event_id)
+        asyncio.run(_go())
+    except Exception:
+        logger.warning("Failed to save feedback", exc_info=True)
 
 
 if __name__ == "__main__":

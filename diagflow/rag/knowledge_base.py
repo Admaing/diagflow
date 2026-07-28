@@ -118,6 +118,9 @@ class KnowledgeBase:
                 set(existing.get("suggestions", []) + suggestions)
             )
             existing["last_seen"] = datetime.now(timezone.utc).isoformat()
+            # Overwrite root_cause if we have a better one (not from empty restore)
+            if root_cause and not existing.get("root_cause"):
+                existing["root_cause"] = root_cause
             return fp
 
         # New case.
@@ -138,6 +141,8 @@ class KnowledgeBase:
                 "error_pattern": error_pattern,
                 "version": version,
                 "fingerprint": fp,
+                "root_cause": root_cause,
+                "suggestions": ",".join(suggestions) if suggestions else "",
                 "created": datetime.now(timezone.utc).isoformat(),
             },
             embedding=embedding,
@@ -299,3 +304,15 @@ class KnowledgeBase:
         if fp in self._fingerprints:
             self._fingerprints[fp]["_disputed"] = True
             logger.info("Marked fingerprint as disputed: %s", fp)
+
+    def on_feedback_incorrect(self, component: str, error_pattern: str, version: str = "",
+                              comment: str = "") -> str | None:
+        """User marked a diagnosis as incorrect → dispute the case in KB.
+
+        Returns the disputed fingerprint, or None if no match found.
+        """
+        fp = self.make_fingerprint(component, error_pattern, version)
+        self.mark_incorrect(fp)
+        if comment:
+            self._fingerprints[fp]["_dispute_comment"] = comment
+        return fp
