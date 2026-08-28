@@ -136,3 +136,20 @@ func TestConfirmCorrectSkipsHistorical(t *testing.T) {
 		t.Fatalf("expected only the executed intent written back, got %v", kb.added)
 	}
 }
+
+func TestSynthesizeFromTraceShortCircuitsOnHistorical(t *testing.T) {
+	a := newTestAgent()
+
+	trace := &InvestigationTrace{}
+	s := trace.AddStep("查 TaskManager OOM")
+	s.MatchedHistorical = true
+	s.HistoricalRootCause = "heap 太小"
+
+	rootCause, _, confidence := a.synthesizeFromTrace(t.Context(), trace, map[string]any{}, "flink", "job_failure")
+	if rootCause != "heap 太小" {
+		t.Fatalf("expected historical root cause, got %q", rootCause)
+	}
+	if confidence != "high" {
+		t.Fatalf("expected high confidence, got %q", confidence)
+	}
+}

@@ -154,6 +154,36 @@ func errClassOr(class, def string) string {
 	return "出现 " + class
 }
 
+// dispatchDeepwiki invokes the registered deepwiki_query tool and returns its
+// result text (empty if the tool is unavailable or fails). The prompt stored on
+// the step is still shown to the user regardless.
+func (a *Agent) dispatchDeepwiki(ctx context.Context, component string, step *InvestigationStep) string {
+	tool, ok := a.tools["deepwiki_query"]
+	if !ok {
+		return ""
+	}
+	var errorClass string
+	for _, s := range step.LogSnippets {
+		if kw := a.firstErrorKeyword(s); kw != "" {
+			errorClass = kw
+			break
+		}
+	}
+	question := component + " 已知 bug: " + errClassOr(errorClass, "异常")
+	result, err := tool.Handler(ctx, map[string]any{
+		"component": component,
+		"question":  question,
+		"version":   "",
+	})
+	if err != nil {
+		return ""
+	}
+	if result.Success {
+		return result.Data
+	}
+	return result.Error
+}
+
 // runIntent executes a single investigation intent: it drives the LLM to choose
 // tools, collects their outputs as log snippets, then asks for a judgment
 // (whether the intent points at a root cause and whether a component bug is
@@ -316,7 +346,10 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 		step.SuspectComponentBug = suspect
 		if suspect {
 			step.DeepwikiPrompt = a.buildDeepwikiPrompt(component, strOr(contextData["version"], ""), step)
-			a.emit(fmt.Sprintf("[%s] component-bug suspected → DeepWiki prompt built", a.eventID))
+			if result := a.dispatchDeepwiki(ctx, component, step); result != "" {
+				step.DeepwikiResult = result
+			}
+			a.emit(fmt.Sprintf("[%s] component-bug suspected → DeepWiki consulted", a.eventID))
 		}
 	}
 
@@ -344,14 +377,21 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 // synthesizeFromTrace builds the final conclusion from an investigation trace,
 // reusing the existing synthesize() path by constructing an evidence pool.
 func (a *Agent) synthesizeFromTrace(ctx context.Context, trace *InvestigationTrace, contextData map[string]any, component, problemType string) (string, []string, string) {
+	// If any intent matched a historical root cause, that already answers the
+	// problem — short-circuit without a further LLM synthesis (matches the
+	// "命中历史即复用结论" intent, and avoids a divergent hallucinated root cause).
+	var historical []string
+	for _, s := range trace.Steps {
+		if s.MatchedHistorical && s.HistoricalRootCause != "" {
+			historical = append(historical, s.HistoricalRootCause)
+		}
+	}
+	if len(historical) > 0 {
+		return historical[0], []string{"复用历史排查结论"}, "high"
+	}
+
 	pool := trace.toEvidencePool()
 	if pool.Len() == 0 {
-		// No evidence gathered; fall back to the trace's matched historical cause.
-		for _, s := range trace.Steps {
-			if s.MatchedHistorical && s.HistoricalRootCause != "" {
-				return s.HistoricalRootCause, []string{"复用历史排查结论"}, "high"
-			}
-		}
 		return "未能收集到足够证据", []string{"扩大日志范围后重试"}, "low"
 	}
 	return a.synthesize(ctx, pool, contextData, component, problemType, "")
