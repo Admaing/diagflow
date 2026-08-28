@@ -182,6 +182,23 @@ func (kb *KnowledgeBase) MarkIncorrect(fp string) {
 	}
 }
 
+// AddInvestigationIntent stores an investigation intent (排查思路) linked to its
+// root cause, so a future similar intent can semantically match and short-circuit.
+// Only called after the user confirms a diagnosis was correct.
+func (kb *KnowledgeBase) AddInvestigationIntent(intentDesc, rootCause, component, version string) {
+	if !kb.Embedder.HasRealEmbeddings() {
+		return // semantic retrieval requires a real embedding backend
+	}
+	caseID := "intent_" + MakeFingerprint(component, intentDesc, version)[:12]
+	text := "排查思路: " + intentDesc + "\n根因: " + rootCause + "\n组件: " + component
+	kb.Store.AddCase(caseID, text, map[string]any{
+		"component":  component,
+		"root_cause": rootCause,
+		"version":    version,
+	}, kb.Embedder.Embed(text))
+	kb.RebuildBM25()
+}
+
 // Stats returns a summary.
 func (kb *KnowledgeBase) Stats() map[string]any {
 	kb.mu.Lock()

@@ -27,6 +27,7 @@ type KnowledgeBase interface {
 	Search(query string, n int) []vectorstore.SearchResult
 	FingerprintMatch(component, errorPattern, version string) map[string]any
 	AddCase(component, errorPattern, version, rootCause string, suggestions []string) string
+	AddInvestigationIntent(intentDesc, rootCause, component, version string)
 	HasRealEmbeddings() bool
 }
 
@@ -42,6 +43,7 @@ type Report struct {
 	MatchedKnowledge bool
 	DurationMS       float64
 	PhasesRun        []string
+	Trace            *InvestigationTrace
 }
 
 // EventFunc is the streaming trace callback (mirrors on_event).
@@ -59,6 +61,7 @@ type Agent struct {
 	onEvent        EventFunc
 
 	errorKeywords []string
+	repositoryMap map[string]string
 
 	tools     map[string]tools.Def
 	eventID   string
@@ -79,6 +82,7 @@ func New(opts ...Option) *Agent {
 	a.maxTokens = int64(cfg.LLM.MaxTokens)
 	a.strategiesDir = cfg.StrategiesDir
 	a.errorKeywords = cfg.RAG.ErrorKeywords
+	a.repositoryMap = cfg.Components.RepoMap
 
 	for _, o := range opts {
 		o(a)

@@ -20,6 +20,7 @@ func main() {
 	scenario := flag.String("scenario", "flink_oom", "scenario name")
 	list := flag.Bool("list", false, "list available scenarios")
 	all := flag.Bool("all", false, "run all scenarios")
+	investigate := flag.Bool("investigate", false, "use intent-driven internal investigation")
 	flag.Parse()
 
 	if *list {
@@ -36,14 +37,14 @@ func main() {
 
 	if *all {
 		for name := range simulated.Scenarios {
-			runOne(name, apiKey)
+			runOne(name, apiKey, *investigate)
 		}
 		return
 	}
-	runOne(*scenario, apiKey)
+	runOne(*scenario, apiKey, *investigate)
 }
 
-func runOne(name, apiKey string) {
+func runOne(name, apiKey string, investigate bool) {
 	ctx := context.Background()
 
 	c, err := simulated.NewCluster(name)
@@ -71,16 +72,24 @@ func runOne(name, apiKey string) {
 	)
 	agent.RegisterTools(defs)
 
-	result, err := agent.Diagnose(ctx,
-		stringOr(c.Context()["component"], "flink"),
-		stringOr(c.Context()["problem"], "unknown"),
-		c.Context(),
-	)
+	component := stringOr(c.Context()["component"], "flink")
+	problem := stringOr(c.Context()["problem"], "unknown")
+
+	var result *diagagent.Report
+	if investigate {
+		result, err = agent.Investigate(ctx, component, problem, c.Context())
+	} else {
+		result, err = agent.Diagnose(ctx, component, problem, c.Context())
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+
 	fmt.Printf("\n%s\n", report.Render(result))
+	if result.Trace != nil {
+		fmt.Printf("\n%s\n", result.Trace.RenderMarkdown())
+	}
 }
 
 func stringOr(v any, def string) string {
