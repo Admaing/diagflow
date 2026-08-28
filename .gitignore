@@ -5,6 +5,10 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
 
 # Deploy — 含公司内网配置, 不上传
 deploy/
@@ -26,3 +30,10 @@ data/cases/
 # ChromaDB
 /tmp/diagflow/
 /chroma-data/
+
+# Stray files — kept on disk but not committed
+#   (check_sr.sh + check_hive.sh contain hardcoded DB/JDBC credentials;
+#    langchain_test/ is dead code unrelated to the DiagFlow agent)
+diagflow/core/check_hive.sh
+diagflow/core/check_sr.sh
+diagflow/langchain_test/

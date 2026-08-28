@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -134,7 +135,9 @@ class DiagAgent:
         problem_type: str,
         context: dict[str, Any],
     ) -> DiagnosisReport:
-        event_id = f"diag-{int(time.time())}-{abs(hash(str(context))) % 10000:04d}"
+        # uuid4 tail avoids relying on Python's string hash(), which is salted
+        # by PYTHONHASHSEED and therefore unstable across processes.
+        event_id = f"diag-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self._event_id = event_id
         self._llm_calls = 0
         self._step_order = 0
@@ -252,23 +255,98 @@ class DiagAgent:
         return report
 
     # ------------------------------------------------------------------
+    # Phase 2 helper: LLM decision point
+    # ------------------------------------------------------------------
+
+    async def _run_llm_decide(
+        self, step: StrategyStep, evidence: EvidencePool, context: dict,
+    ) -> str:
+        """One LLM call to decide the diagnostic branch.
+
+        LLM sees the evidence collected so far and picks one of the
+        strategy-defined choices. Returns the chosen value (string).
+        """
+        choices_desc = "\n".join(
+            f"- {c.get('value', '?')}: {c.get('description', '')}"
+            for c in step.decide_choices
+        )
+        choice_values = [c["value"] for c in step.decide_choices if c.get("value")]
+        if not choice_values:
+            return ""
+
+        self._llm_calls += 1
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=128,
+                temperature=0.1,
+                tools=[{
+                    "name": "branch_decision",
+                    "description": "Pick the diagnostic branch.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "choice": {"type": "string", "enum": choice_values},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["choice"],
+                    },
+                }],
+                tool_choice={"type": "tool", "name": "branch_decision"},
+                messages=[{"role": "user", "content": f"""{step.decide_prompt}
+
+Evidence collected so far:
+{evidence.summary()}
+
+Cluster context:
+{json.dumps({k: v for k, v in context.items() if k != "topology"}, default=str)}
+
+Choices:
+{choices_desc}"""}],
+            )
+            tool_uses = [b for b in resp.content if b.type == "tool_use"]
+            if tool_uses:
+                choice = tool_uses[0].input.get("choice", "")
+                reason = tool_uses[0].input.get("reason", "")
+                await self._emit(f"[strategy] LLM branch: {choice} ({reason})")
+                return choice
+        except Exception:
+            logger.warning("LLM decide step failed", exc_info=True)
+        return ""
+
+    # ------------------------------------------------------------------
     # Phase 2: Strategy execution
     # ------------------------------------------------------------------
 
     async def _run_strategy(
         self, strategy: Strategy, context: dict, evidence: EvidencePool,
     ) -> None:
+        current_decision = ""  # set by llm_decide steps
         for batch in strategy.group_by_priority():
-            tasks = [
-                self._execute_step(step, context, evidence)
-                for step in batch
-            ]
+            tasks = []
+            for step in batch:
+                if not step.should_run(current_decision):
+                    await self._emit(
+                        f"[strategy] skip {step.tool or step.action} "
+                        f"— condition '{step.if_decision}' != '{current_decision}'"
+                    )
+                    continue
+                tasks.append(self._execute_step(step, context, evidence))
             await asyncio.gather(*tasks)
+
+            # After each batch, check for llm_decide steps
+            for step in batch:
+                if step.action == "llm_decide" and step.should_run(current_decision):
+                    decision = await self._run_llm_decide(step, evidence, context)
+                    if decision:
+                        current_decision = decision
+                        await self._emit(f"[strategy] LLM decided: {current_decision}")
+                    break  # one decision per batch
 
     async def _execute_step(
         self, step: StrategyStep, context: dict, evidence: EvidencePool,
     ) -> None:
-        if step.action in ("fingerprint_match",):
+        if step.action in ("fingerprint_match", "llm_decide"):
             return
         if step.action != "tool_call":
             return
@@ -717,6 +795,9 @@ IMPORTANT: Call the report_diagnosis tool with your structured conclusion. Every
             logger.warning("KB indexing failed", exc_info=True)
 
     async def _emit(self, msg: str) -> None:
+        # Always surface phase/step trace via the logger so diagnosis progress is
+        # traceable even when no on_event callback is wired up.
+        logger.info("%s", msg)
         if self.on_event:
             r = self.on_event(msg)
             if asyncio.iscoroutine(r):

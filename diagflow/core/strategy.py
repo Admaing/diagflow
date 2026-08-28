@@ -35,12 +35,33 @@ import yaml
 
 @dataclass
 class StrategyStep:
-    """A single step in a diagnostic strategy."""
-    action: str                 # "fingerprint_match" | "tool_call"
+    """A single step in a diagnostic strategy.
+
+    Supports conditional execution via ``if_decision`` + ``llm_decide`` steps:
+
+    - ``action: llm_decide`` — calls LLM once with the evidence collected so far,
+      returns a structured decision (e.g. "other_component" vs "flink_only").
+    - ``if_decision: "value"`` — step only runs if a prior llm_decide step chose
+      that value.
+
+    This replaces brittle keyword matching with LLM judgment.
+    """
+    action: str                 # "fingerprint_match" | "tool_call" | "llm_decide"
     description: str = ""
     tool: str = ""              # only for action=tool_call
     params: dict[str, Any] = field(default_factory=dict)
-    priority: int = 10          # lower runs first
+    priority: int = 10
+    # llm_decide fields
+    decide_prompt: str = ""     # what to ask the LLM
+    decide_choices: list[dict] = field(default_factory=list)  # [{value, description}]
+    # conditional execution (applies to tool_call steps)
+    if_decision: str = ""       # only run if llm_decide returned this value
+
+    def should_run(self, current_decision: str = "") -> bool:
+        """Check whether this step should execute given the LLM's decision."""
+        if not self.if_decision:
+            return True  # no condition → always run
+        return current_decision == self.if_decision
 
     def render_params(self, context: dict[str, Any]) -> dict[str, Any]:
         """Resolve {{ context.xxx }} template variables from context."""
@@ -174,6 +195,9 @@ def _parse_strategy_file(path: Path, component: str, problem_type: str) -> Strat
             tool=step_data.get("tool", ""),
             params=step_data.get("params", {}),
             priority=step_data.get("priority", 10),
+            decide_prompt=step_data.get("decide_prompt", ""),
+            decide_choices=step_data.get("decide_choices", []),
+            if_decision=step_data.get("if_decision", ""),
         ))
 
     return Strategy(

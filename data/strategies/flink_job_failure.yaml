@@ -1,53 +1,127 @@
-# Flink 任务失败诊断策略 — 生产模式
+# Flink 任务失败诊断策略
 #
-# Phase 2 只做"确定性该做"的事情：指纹检查 + 进程检查 + YARN 查询。
-# 日志路径因集群而异（不同部署、不同版本路径不同），
-# 交给 Phase 3 Agent 用 ssh_exec find 动态发现。
+# 第一阶段收集初步证据，然后 LLM 判断是否涉及其他组件，
+# 据此分支执行不同的后续排查步骤。
 
 component: flink
 problem_type: job_failure
 version: ">=1.14"
 
 steps:
+  # ---- 初步收集 ----
   - action: fingerprint_match
     description: "Check known issues first"
     priority: 0
 
   - action: tool_call
     tool: query_yarn
-    description: "Check YARN for failed Flink apps"
+    description: "Check YARN for failed Flink apps and get container IDs"
     params:
       action: "list_apps"
       app_name: "RUNNING,FAILED,KILLED,FINISHED"
     priority: 1
 
   - action: tool_call
-    tool: call_umr_agent
-    description: "Check if JobManager process runs on master1"
+    tool: query_yarn
+    description: "Get node info + log paths for the failed app"
+    params:
+      action: "app_nodes"
+      app_id: "{{ context.job_id }}"
+    priority: 1
+
+  - action: tool_call
+    tool: ssh_exec
+    description: "Get stderr from YARN container logs (contains errors)"
     params:
       node_name: "master1"
-      action: "CheckProcess"
-      params:
-        ProcessName: "StandaloneSessionClusterEntrypoint"
-    priority: 1
+      cmd: "yarn logs -applicationId {{ context.job_id }} -logFiles stderr -size -1 2>/dev/null | tail -200"
+      timeout_s: 30
+    priority: 2
 
+  # ---- LLM 判断分支 ----
+  - action: llm_decide
+    description: "判断是否涉及其他组件(如 HDFS 磁盘满、NM 异常、网络故障)"
+    priority: 3
+    decide_prompt: |
+      Based on the YARN application logs and stderr collected above,
+      determine whether this Flink job failure was caused by another
+      infrastructure component, or is a pure Flink issue.
+
+      "other_component" examples: HDFS disk full → NoSpaceLeft; YARN NM
+      unhealthy → container killed; network → Connection refused;
+      system OOM → exit code 137 without Java OOM in stderr.
+
+      "flink_only" examples: Java OutOfMemoryError in stderr; checkpoint
+      timeout with backpressure; Flink code exception.
+    decide_choices:
+      - value: "other_component"
+        description: "Root cause is another component (HDFS/YARN/system)"
+      - value: "flink_only"
+        description: "Pure Flink issue (code/config/checkpoint/OOM)"
+
+  # ---- 分支 A: 涉及其他组件 ----
   - action: tool_call
     tool: call_umr_agent
-    description: "Check if TaskManager process runs on core1"
-    params:
-      node_name: "core1"
-      action: "CheckProcess"
-      params:
-        ProcessName: "TaskManagerRunner"
-    priority: 1
-
-  - action: tool_call
-    tool: call_umr_agent
-    description: "Get base info from master1"
+    description: "Get cluster node base info (CPU/mem/disk)"
     params:
       node_name: "master1"
       action: "GetBaseInfo"
-    priority: 2
+    priority: 4
+    if_decision: "other_component"
+
+  - action: tool_call
+    tool: ssh_exec
+    description: "Check HDFS disk usage on master node"
+    params:
+      node_name: "master1"
+      cmd: "hdfs dfsadmin -report 2>/dev/null | grep -E 'DFS|Capacity|Remaining|Datanode' | head -20"
+      timeout_s: 15
+    priority: 4
+    if_decision: "other_component"
+
+  - action: tool_call
+    tool: ssh_exec
+    description: "Check YARN NodeManager status and disk"
+    params:
+      node_name: "core1"
+      cmd: "df -h /data 2>/dev/null; echo '---'; free -h 2>/dev/null"
+      timeout_s: 10
+    priority: 4
+    if_decision: "other_component"
+
+  - action: tool_call
+    tool: deepwiki_query
+    description: "Verify if this component interaction is a known bug"
+    params:
+      component: "flink"
+      question: "Flink job fails due to HDFS disk full or YARN NM issue, version {{ context.version }}"
+      version: "{{ context.version }}"
+    priority: 5
+    if_decision: "other_component"
+
+  # ---- 分支 B: 纯 Flink 问题 ----
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Get Flink TaskManager logs for detailed error analysis"
+    params:
+      node_name: "core1"
+      action: "GetLogs"
+      params:
+        Path: "/data/flink/log/taskmanager.log"
+        Keywords: "ERROR,FATAL,OutOfMemory,Exception"
+        MaxLines: "100"
+    priority: 4
+    if_decision: "flink_only"
+
+  - action: tool_call
+    tool: deepwiki_query
+    description: "Verify if this Flink error is a known bug"
+    params:
+      component: "flink"
+      question: "Flink taskmanager error in version {{ context.version }}"
+      version: "{{ context.version }}"
+    priority: 5
+    if_decision: "flink_only"
 
 knowledge_base:
   fingerprint: true

@@ -1,33 +1,55 @@
 component: flink
-description: "Default Flink diagnosis strategy — for job failures, checkpoint issues, and OOM"
+description: "Default Flink diagnosis strategy — for unknown Flink problem types"
+version: ">=1.14"
+
 steps:
-  - phase: "fingerprint"
-    action: fingerprint_match
-    description: "Check if error pattern matches known Flink issues"
-    params: { component: "flink" }
+  - action: fingerprint_match
+    description: "Check known Flink issues first"
+    priority: 0
 
-  - phase: "parallel_collection"
-    agents:
-      - name: "log_analyst"
-        tools: ["query_node_log"]
-        description: "Examine TaskManager and JobManager logs for errors"
-      - name: "metrics_analyst"
-        tools: ["query_metrics"]
-        description: "Check heap usage, GC pauses, checkpoint stats"
-      - name: "config_analyst"
-        tools: ["read_config"]
-        description: "Review Flink and YARN configuration"
+  - action: tool_call
+    tool: query_yarn
+    description: "Check YARN for failed Flink apps"
+    params:
+      action: "list_apps"
+      app_name: "RUNNING,FAILED,KILLED,FINISHED"
+    priority: 1
 
-  - phase: "synthesis"
-    action: supervisor_synthesis
-    description: "Cross-reference all evidence and produce diagnosis"
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Get cluster node base info (CPU/mem/disk)"
+    params:
+      node_name: "master1"
+      action: "GetBaseInfo"
+    priority: 1
 
-investigation_guide: |
-  For Flink job failures, the diagnostic flow is:
-  1. Check if this is a known issue (fingerprint_match)
-  2. Read JobManager log for job lifecycle events
-  3. Read TaskManager logs for ERROR/WARN with focus on OOM, GC, checkpoint
-  4. Query Flink REST API for job status, checkpoint stats, backpressure
-  5. Review flink-conf.yaml for heap size, parallelism, checkpoint interval
-  6. Cross-reference: do log errors match metrics anomalies?
-  7. Produce finding with root cause, evidence, and actionable suggestions
+  - action: tool_call
+    tool: ssh_exec
+    description: "Scan TaskManager/JobManager logs for errors"
+    params:
+      node_name: "master1"
+      cmd: "grep -E 'ERROR|Exception|FATAL' /data/flink/log/jobmanager.log 2>/dev/null | tail -100"
+      timeout_s: 30
+    priority: 2
+
+  - action: tool_call
+    tool: deepwiki_query
+    description: "Verify error class against upstream known bugs"
+    params:
+      component: "flink"
+      question: "Flink job failure / error in version {{ context.version }}"
+      version: "{{ context.version }}"
+    priority: 3
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+
+validation:
+  required_evidence_sources: ["log"]
+  min_evidence_count: 1
+
+output:
+  suggestions_min: 2
+  suggestions_max: 5

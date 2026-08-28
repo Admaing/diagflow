@@ -1,5 +1,10 @@
 # 生产级 LLM Agent 可观测体系
 
+> ⚠️ **本文为设计提案，尚未实现。** Prometheus metrics、JSON 结构化日志（Loki/ES）、
+> Langfuse 集成目前均**未落地到代码**。现有可观测性仅有：
+> MySQL 可选持久化（`observability/db.py`）+ event tracker（`observability/event_tracker.py`）
+> + Markdown 报告（`observability/report.py`）。下文描述的是目标架构，供后续演进参考。
+
 ## 架构总览
 
 ```

@@ -4,30 +4,38 @@ version: ">=1.14"
 
 steps:
   - action: fingerprint_match
-    description: "Check known Flink checkpoint issues"
+    description: "Check known Flink checkpoint issues first"
     priority: 0
 
   - action: tool_call
-    tool: query_node_log
+    tool: call_umr_agent
     description: "Scan TaskManager log for checkpoint failures"
     params:
-      log_path: "taskmanager-1.log"
-      keywords: "Checkpoint,checkpoint,expired,FAILED,barrier,alignment"
+      node_name: "core1"
+      action: "GetLogs"
+      params:
+        Path: "/data/flink/log/taskmanager.log"
+        Keywords: "Checkpoint,checkpoint,expired,FAILED,barrier,alignment"
+        MaxLines: "100"
     priority: 1
 
   - action: tool_call
-    tool: query_metrics
-    description: "Check checkpoint and backpressure metrics"
+    tool: ssh_exec
+    description: "Grep JobManager log for checkpoint expiry and barrier alignment"
     params:
-      metric_types: "checkpoint_failure_rate,backpressure_level,input_rate_mbps,gc_pause_ms_avg"
-    priority: 2
+      node_name: "master1"
+      cmd: "grep -E 'Checkpoint|checkpoint|expired|barrier|alignment' /data/flink/log/jobmanager.log 2>/dev/null | tail -100"
+      timeout_s: 15
+    priority: 1
 
   - action: tool_call
-    tool: read_config
-    description: "Review Flink checkpoint config"
+    tool: deepwiki_query
+    description: "Verify checkpoint expiry pattern against upstream known bugs"
     params:
-      config_path: "flink-conf.yaml"
-    priority: 3
+      component: "flink"
+      question: "Flink checkpoint failure / alignment timeout due to backpressure in version {{ context.version }}"
+      version: "{{ context.version }}"
+    priority: 2
 
 knowledge_base:
   fingerprint: true
@@ -35,7 +43,7 @@ knowledge_base:
   bm25_search: true
 
 validation:
-  required_evidence_sources: ["log", "metrics"]
+  required_evidence_sources: ["log"]
   min_evidence_count: 2
 
 output:

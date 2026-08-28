@@ -4,29 +4,46 @@ version: ">=3.3"
 
 steps:
   - action: fingerprint_match
-    description: "Check known HDFS disk issues"
+    description: "Check known HDFS disk issues first"
     priority: 0
 
   - action: tool_call
-    tool: query_node_log
-    description: "Scan DataNode log for disk errors"
+    tool: ssh_exec
+    description: "Report DataNode disk usage and remaining capacity"
     params:
-      log_path: "datanode-003.log"
-      keywords: "NoSpaceLeft,disk full,FAILED,out of space"
+      node_name: "core1"
+      cmd: "hdfs dfsadmin -report 2>/dev/null | grep -E 'DFS|Capacity|Remaining|Datanode' | head -20"
+      timeout_s: 15
     priority: 1
 
   - action: tool_call
-    tool: query_metrics
-    description: "Check disk usage metrics"
+    tool: call_umr_agent
+    description: "Scan DataNode log for NoSpaceLeft / disk full errors"
     params:
-      metric_types: "data1_usage_pct,data2_usage_pct,data3_usage_pct,block_repair_failures"
+      node_name: "core1"
+      action: "GetLogs"
+      params:
+        Path: "/data/hadoop/log/hdfs/hadoop-hdfs-datanode*.log"
+        Keywords: "NoSpaceLeft,disk full,FAILED,out of space"
+        MaxLines: "100"
+    priority: 1
+
+  - action: tool_call
+    tool: ssh_exec
+    description: "Check raw disk space on data volumes"
+    params:
+      node_name: "core1"
+      cmd: "df -h /data 2>/dev/null; echo '---'; du -sh /data/* 2>/dev/null | sort -rh | head -10"
+      timeout_s: 15
     priority: 2
 
   - action: tool_call
-    tool: read_config
-    description: "Review HDFS disk config"
+    tool: deepwiki_query
+    description: "Verify HDFS disk-full failure mode against upstream known bugs"
     params:
-      config_path: "hdfs-site.xml"
+      component: "hdfs"
+      question: "HDFS DataNode volume out of space / NoSpaceLeft error in version {{ context.version }}"
+      version: "{{ context.version }}"
     priority: 3
 
 knowledge_base:
@@ -36,7 +53,7 @@ knowledge_base:
   fusion: rrf
 
 validation:
-  required_evidence_sources: ["log", "metrics"]
+  required_evidence_sources: ["log"]
   min_evidence_count: 2
 
 output:

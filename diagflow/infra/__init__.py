@@ -459,9 +459,12 @@ class RealCluster:
         if not master:
             return f"[Error] No master node in cluster {self.instance_id}"
         assert self._agent is not None
+        # Same compat lookup as get_node_log / _umr_agent_handler: umrAgent key
+        # arrives as either "agent_key" or "umr_agent_key" across API responses.
+        agent_key = master.get("agent_key", "") or master.get("umr_agent_key", "")
         return await self._agent.call(
             ipv6=master["ipv6"],
-            agent_key=master["umr_agent_key"],
+            agent_key=agent_key,
             action="GetLogs",
             params={"Path": config_path},
         )

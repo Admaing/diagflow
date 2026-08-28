@@ -4,29 +4,45 @@ version: ">=3.3"
 
 steps:
   - action: fingerprint_match
-    description: "Check known YARN queue issues"
+    description: "Check known YARN queue issues first"
     priority: 0
 
   - action: tool_call
-    tool: query_node_log
-    description: "Scan ResourceManager log for queue issues"
+    tool: query_yarn
+    description: "List YARN apps, including ACCEPTED (queued) and pending states"
     params:
-      log_path: "resourcemanager.log"
-      keywords: "capacity,pending,denied,maxCapacity,ACCEPTED"
+      action: "list_apps"
+      app_name: "RUNNING,ACCEPTED,PENDING,SUBMITTED"
     priority: 1
 
   - action: tool_call
-    tool: query_metrics
-    description: "Check cluster resource metrics"
+    tool: ssh_exec
+    description: "Report per-queue capacity and pending app counts from ResourceManager"
     params:
-      metric_types: "cluster_memory_used_gb,cluster_memory_total_gb,cluster_vcores_used,cluster_vcores_total,pending_apps,queue_production_used_pct"
+      node_name: "master1"
+      cmd: "yarn queue -status default 2>/dev/null; echo '---'; yarn top 2>/dev/null | head -30"
+      timeout_s: 15
+    priority: 1
+
+  - action: tool_call
+    tool: call_umr_agent
+    description: "Scan ResourceManager log for capacity/pending/denied messages"
+    params:
+      node_name: "master1"
+      action: "GetLogs"
+      params:
+        Path: "/data/hadoop/log/yarn/hadoop-yarn-resourcemanager*.log"
+        Keywords: "capacity,pending,denied,maxCapacity,ACCEPTED"
+        MaxLines: "100"
     priority: 2
 
   - action: tool_call
-    tool: read_config
-    description: "Review YARN scheduler config"
+    tool: deepwiki_query
+    description: "Verify YARN queue capacity behavior against upstream known bugs"
     params:
-      config_path: "yarn-site.xml"
+      component: "yarn"
+      question: "YARN queue stuck / capacity exhausted / pending apps in version {{ context.version }}"
+      version: "{{ context.version }}"
     priority: 3
 
 knowledge_base:
@@ -35,7 +51,7 @@ knowledge_base:
   bm25_search: true
 
 validation:
-  required_evidence_sources: ["log", "metrics"]
+  required_evidence_sources: ["log"]
   min_evidence_count: 2
 
 output:

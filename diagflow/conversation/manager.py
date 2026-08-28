@@ -408,7 +408,7 @@ class ConversationManager:
         if any(w in msg for w in ["证据", "日志", "指标"]):
             if self.state.report:
                 lines = ["证据链:\n"]
-                for ev in self.state.evidence_summary:
+                for ev in self.state.report.evidence_summary:
                     lines.append(f"- [{ev.get('source_agent', '?')}] {ev.get('summary', '')}")
                 return "\n".join(lines)
             return "请先完成一次诊断。"

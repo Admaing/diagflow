@@ -5,70 +5,81 @@
 
 **DiagFlow** is an AI agent system that automates root cause analysis for big data platform failures. Given a user-reported problem (e.g., "Flink job FAILED", "HDFS no space left"), DiagFlow systematically gathers evidence from logs, metrics, and configuration, then produces a structured diagnosis with actionable suggestions.
 
-Inspired by [得物技术团队的 Troubleshooter](https://cloud.tencent.com/developer/article/2682409), DiagFlow extends the concept with self-built agent framework, hybrid search RAG, and multi-agent parallel orchestration.
+Inspired by [得物技术团队的 Troubleshooter](https://cloud.tencent.com/developer/article/2682409), DiagFlow uses a **single Agent** (`DiagAgent`) with SDK-native tool use, a YAML-driven deterministic strategy layer, and hybrid-search RAG.
 
 ## Architecture
 
+DiagFlow v3 is a **single Agent** with a five-phase pipeline. The LLM is only invoked
+when deterministic logic cannot already answer the question.
+
 ```
-┌──────────────────────────────────────────────────────────┐
-│                     User Input                            │
-│         (problem description + cluster context)           │
-└─────────────────────┬────────────────────────────────────┘
-                      │
-┌─────────────────────▼────────────────────────────────────┐
-│                  Orchestrator                             │
-│    Coordinates multi-agent diagnosis workflow             │
-└────┬──────────┬──────────┬──────────┬────────────────────┘
-     │          │          │          │
-┌────▼───┐ ┌───▼────┐ ┌──▼────┐ ┌──▼──────────┐
-│  Log   │ │ Config │ │Metric │ │ Knowledge   │
-│ Analyst│ │ Analyst│ │Analyst│ │ Agent (RAG) │
-└───┬────┘ └───┬────┘ └───┬───┘ └──┬─────────┘
-    │          │          │        │
-    │     ┌────▼──────────▼──┐     │
-    │     │  Tool Registry   │     │
-    │     │  (5 tools)       │     │
-    │     └────────┬─────────┘     │
-    │              │               │
-┌───▼──────────────▼───────────────▼──────────────────┐
-│              Simulated Environment                   │
-│  (4 pre-built fault scenarios, realistic logs)       │
-└─────────────────────────────────────────────────────┘
+                    User Input (problem + cluster context)
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │   DiagAgent.diagnose()      │
+                    │                             │
+                    │  Phase 1  KB semantic search │ ← 0 LLM
+                    │  Phase 2  YAML strategy exec │ ← 0 LLM (parallel by priority)
+                    │  Phase 2.5 MD5 fingerprint   │ ← 0 LLM
+                    │  Phase 3  SDK ReAct          │ ← LLM (tool_use loop)
+                    │  Phase 4  Synthesize + verify│ ← LLM (4-layer validator)
+                    │  Phase 5  Auto-index to KB   │ ← 0 LLM (high-confidence only)
+                    └──────────────┬──────────────┘
+                                   ▼
+                     DiagnosisReport → Markdown
 ```
+
+- **Phase 1–2.5** cover the deterministic fast paths — semantic search, YAML-driven
+  evidence collection, and exact fingerprint matching.
+- **Phase 3** hands the remaining unknown to the LLM via the Anthropic SDK's native
+  tool loop (translated to DeepSeek by the modelverse proxy).
+- **Phase 4** synthesizes a structured conclusion and validates it through four
+  hallucination-control layers.
 
 ## Features
 
-### Agent Framework (自建, ~500 行核心代码)
-- **ReAct Loop**: Reasoning → Acting → Observation cycle (inspired by Yao et al. 2022)
-- **Tool Abstraction**: Each tool has JSON Schema, timeout isolation, structured result
-- **Evidence Pool**: Decoupled evidence sharing between specialist agents
-- **Session Memory**: Sliding-window context management
+### Single-Agent ReAct + YAML Strategy
 
-### Multi-Agent Architecture
-| Agent | Role | Tools |
-|-------|------|-------|
-| **Supervisor** | Orchestrates diagnosis, synthesizes final report | All tools |
-| **Log Analyst** | Extracts error patterns from component logs | `query_node_log` |
-| **Config Analyst** | Reviews configuration for misconfigurations | `read_config` |
-| **Metrics Analyst** | Analyzes monitoring metrics for anomalies | `query_metrics` |
+- **SDK-native tool use**: `DiagAgent` uses `Anthropic().messages.create(...)` with the
+  tool schema, relying on the SDK's native `tool_use` loop rather than a hand-rolled ReAct.
+- **YAML-driven deterministic phase**: `data/strategies/*.yaml` defines *what* to collect
+  (which tools, in what order, at what priority). Same-priority steps run in parallel.
+  Steps support conditional branching via `llm_decide` + `if_decision`.
+- **Evidence pool**: findings are deposited in a thread-safe `EvidencePool` and shared
+  across phases; specialist steps never talk to each other directly.
+
+### 5 Tools (`tools/v3tools.py`)
+
+| Tool | Purpose |
+|------|---------|
+| `query_yarn` | Query YARN RM for apps / node placement |
+| `ssh_exec` | Read-only shell commands (allowlist + blacklist guarded) |
+| `call_umr_agent` | HMAC-SHA1 signed umrAgent calls (GetLogs / CheckProcess / GetBaseInfo / GetAppList) |
+| `deepwiki_query` | Verify error classes against upstream component repos via MCP |
+| `fingerprint_match` | MD5 exact-match against known historical cases |
 
 ### Hybrid RAG (ChromaDB + BM25)
+
 - **Fingerprint Match**: MD5-based exact match for known issues (fast path, zero LLM cost)
-- **Semantic Search**: ChromaDB vector similarity for intent-level matching
+- **Semantic Search**: ChromaDB / Milvus Lite vector similarity for intent-level matching
 - **BM25**: Keyword-level exact match for error codes and stack traces
 - **RRF Fusion**: Reciprocal Rank Fusion to merge both result sets
+- Falls back to a Milvus Lite backend via `DIAGFLOW_VECTOR_STORE__BACKEND=milvus`.
 
 ### Four-Layer Illusion Control
-| Layer | Method | LLM? | Latency |
-|-------|--------|------|---------|
-| 1 | Format validation (required sections, table structure) | ❌ | <1ms |
-| 2 | Cross-source consistency (timeline, metric × log cross-ref) | ❌ | <1ms |
-| 3 | Independent Validation Agent review | ✅ | ~1s |
-| 4 | Retry with feedback (max 2, format issues don't count) | ✅ | controlled |
+
+| Layer | Method | LLM? |
+|-------|--------|------|
+| 1 | Format validation (root cause length, non-empty suggestions/evidence) | ❌ |
+| 2 | Cross-source consistency (root cause references evidence keywords) | ❌ |
+| 3 | Independent LLM review (structured `validate_diagnosis` tool call) | ✅ |
+| 4 | Retry with feedback (max 2) | ✅ |
 
 ### Pre-built Fault Scenarios
+
 | Scenario | Component | Fault | Expected Root Cause |
-|----------|-----------|-------|-------------------|
+|----------|-----------|-------|---------------------|
 | `flink_oom` | Flink 1.14.3 | TaskManager OOM | Java heap space OutOfMemoryError |
 | `flink_checkpoint_fail` | Flink 1.16.0 | Checkpoint failure | Checkpoint alignment timeout due to backpressure |
 | `hdfs_disk_full` | HDFS 3.3.4 | Disk full | DataNode volume out of space |
@@ -77,8 +88,9 @@ Inspired by [得物技术团队的 Troubleshooter](https://cloud.tencent.com/dev
 ## Quick Start
 
 ### Prerequisites
+
 - Python 3.11+
-- Anthropic API key (for LLM-powered mode; mock mode works without it)
+- `DEEPSEEK_API_KEY` (or `LLM_API_KEY`) for LLM-powered mode; mock mode works without it.
 
 ### Installation
 
@@ -98,8 +110,8 @@ python -m demo.run --list
 # Run Flink OOM diagnosis (mock mode — no API key needed)
 python -m demo.run --scenario flink_oom
 
-# Run with real LLM
-export ANTHROPIC_API_KEY=sk-...
+# Run with real LLM (via modelverse proxy → DeepSeek)
+export DEEPSEEK_API_KEY=sk-...
 python -m demo.run --scenario flink_oom
 
 # Run all scenarios
@@ -112,83 +124,34 @@ python -m demo.run --all
 diagflow/
 ├── demo/run.py              # Entry point: CLI demo with scenario selection
 ├── diagflow/
-│   ├── core/                # ★ Self-built Agent framework
-│   │   ├── agent.py         #   ReAct loop base class
-│   │   ├── tool.py          #   Tool abstraction with timeout isolation
-│   │   ├── llm.py           #   LLM client (Anthropic, round-robin keys)
-│   │   ├── memory.py        #   Session memory + EvidencePool
-│   │   ├── orchestrator.py  #   Multi-agent orchestrator
-│   │   └── validator.py     #   4-layer illusion control
-│   ├── agents/              # Multi-agent implementations
-│   │   ├── supervisor.py
-│   │   ├── log_analyst.py
-│   │   ├── metrics_analyst.py
-│   │   └── validation_agent.py
-│   ├── tools/               # Tool implementations (5 tools)
-│   │   ├── node_log.py
-│   │   ├── flink_api.py
-│   │   ├── metrics_api.py
-│   │   └── fingerprint.py
+│   ├── config.py            # Centralized env-driven config
+│   ├── core/                # ★ Single-Agent diagnostic engine
+│   │   ├── diag_agent.py    #   DiagAgent: 5-phase pipeline (798 lines)
+│   │   ├── strategy.py      #   YAML strategy parsing + Step rendering
+│   │   ├── memory.py        #   EvidencePool + SessionMemory
+│   │   └── validator.py     #   4-layer hallucination control
+│   ├── tools/v3tools.py     # 5 tools (query_yarn/ssh_exec/call_umr_agent/...)
 │   ├── rag/                 # RAG system
-│   │   ├── vector_store.py  #   ChromaDB wrapper
-│   │   ├── embedder.py      #   Embedding abstraction
+│   │   ├── vector_store.py  #   ChromaDB / Milvus Lite factory
+│   │   ├── embedder.py      #   OpenAI embeddings + offline hash fallback
 │   │   ├── retriever.py     #   Hybrid search (semantic + BM25 + RRF)
-│   │   └── knowledge_base.py#   Case lifecycle management
-│   ├── workflows/           # Component-specific diagnostic workflows
+│   │   └── knowledge_base.py#   Case lifecycle + fingerprint persistence
+│   ├── infra/__init__.py    # Production adapter (ZK discovery + umrAgent + node API)
+│   ├── conversation/        # CLI/Web conversation manager (multi-turn)
 │   ├── simulated/           # Mock environment for demo
 │   │   └── scenarios/       # 4 pre-built fault scenarios
-│   └── observability/       # Event tracking + report generation
+│   └── observability/       # MySQL persistence + event tracker + Markdown report
+├── tests/                   # pytest suite
 └── data/
     ├── cases/               # Seeded historical cases (Markdown)
     └── strategies/          # Configurable strategy YAML files
 ```
 
-## Comparison: DiagFlow vs. Troubleshooter (得物)
-
-| Dimension | Troubleshooter | DiagFlow |
-|-----------|---------------|----------|
-| Agent Framework | Spring AI Alibaba | **Self-built** (ReAct ~500 lines) |
-| Agent Count | Single Supervisor | **Multi-agent** (Supervisor + 3 specialists) |
-| Agent Execution | Serial | **Parallel** (specialists run concurrently) |
-| RAG | MD5 fingerprint only | **Hybrid** (fingerprint + ChromaDB + BM25 + RRF) |
-| Target Systems | Microservices (Java) | **Big Data** (Flink / HDFS / YARN) |
-| Language | Java | **Python** |
-| Simulated Env | N/A (production only) | **4 pre-built scenarios** for demo |
-
-## Examples
-
-### Input
-```
-Component: flink
-Problem: 任务挂掉，状态 FAILED
-Cluster: c-uhadoop-001 (北京二)
-Version: 1.14.3
-Job ID: job_xxx
-Detail: 最后一次 Checkpoint 失败
-```
-
-### Output
-```markdown
-## 根因分析
-**根因**: TaskManager Java heap space OutOfMemoryError
-**置信度**: 🟢 高
-
-## 修复建议
-1. 增加 taskmanager.memory.heap.size 至 4096m
-2. 降低 parallelism.default 缓解内存争用
-3. 配置 input_rate_mbps 告警阈值（>30 MB/s 触发）
-
-## 证据链
-- [log_analyst] TaskManager-1 OOM at 14:23:01 (conf=0.9)
-- [metrics_analyst] Heap usage 95.5%, GC pause avg 850ms (conf=0.8)
-- [config_analyst] 2GB heap for 4 slots (conf=0.7)
-```
-
 ## Production Deployment
 
 DiagFlow ships with a **production adapter** (`diagflow/infra/`) that bridges the
-agent framework to real UHadoop infrastructure. The Tool layer is identical in
-demo and production — only the data source changes.
+agent to real UHadoop infrastructure. The Tool layer is identical in demo and
+production — only the data source changes.
 
 ### Architecture: Demo vs Production
 
@@ -202,11 +165,11 @@ Production Mode (DIAGFLOW_MODE=production):
   Tools → RealCluster
          ↓
   ┌──────────────────────────────────────────────────┐
-  │ MySQLClient    → t_uhadoop_node + t_uhadoop_umragent │
-  │                 (node IPs, ipv6, agent keys)        │
-  │ UCloudServiceDiscovery → ZooKeeper (NameContainer)  │
-  │                 (find uhadoop-go monitor, etc.)     │
-  │ UmrAgentClient → http://[ipv6]:65431/?Action=GetLogs│
+  │ UCloudServiceDiscovery → ZooKeeper (NameContainer) │
+  │                 (find uhadoop-manage, monitor)     │
+  │ NodeInfoClient → uhadoop-manage HTTP API           │
+  │                 (cluster/node metadata — NO MySQL) │
+  │ UmrAgentClient → http://[ipv6]:65431/?Action=...   │
   │                 (HMAC-SHA1 signed, port of util/agent.js) │
   └──────────────────────────────────────────────────┘
 ```
@@ -218,9 +181,8 @@ The production adapter faithfully ports existing uhadoop-task patterns to Python
 | uhadoop-task (Node.js) | DiagFlow (Python) | Notes |
 |----------------------|------------------|-------|
 | `libs/name_container.js` | `UCloudServiceDiscovery` | ZK-based service discovery |
-| `libs/db.js` | `MySQLClient` | Connection pool, **read-only account** |
 | `util/agent.js` | `UmrAgentClient` | HMAC-SHA1 signing replicated exactly |
-| `logic/cluster_info.js` | `ClusterInfoRepository` | Read-only node/cluster lookups |
+| `controllor/describe_cluster_nodes.js` | `NodeInfoClient` | Node metadata via uhadoop-manage HTTP API |
 
 ### Deploy to Kubernetes
 
@@ -229,32 +191,32 @@ The production adapter faithfully ports existing uhadoop-task patterns to Python
 docker build -t uhadoop/diagflow:v0.1.0 -f deploy/Dockerfile .
 
 # Deploy
-kubectl apply -f deploy/k8s.yaml
+kubectl apply -f deploy/kubernetes/diagflow-statefulset.yaml
 
 # Set secrets
 kubectl create secret generic diagflow-secrets \
-  --from-literal=ANTHROPIC_API_KEY=sk-... \
-  --from-literal=DB_UHADOOP_PASSWORD=... -n uhadoop
+  --from-literal=DEEPSEEK_API_KEY=sk-... -n uhadoop
 ```
 
-Required environment variables (see `deploy/k8s.yaml`):
+Required environment variables (see `deploy/kubernetes/`):
 
 | Variable | Purpose |
 |----------|---------|
 | `DIAGFLOW_MODE=production` | Enable real infrastructure (vs demo) |
 | `ZK_HOSTS` | ZooKeeper connection for service discovery |
-| `DB_UHADOOP_*` | MySQL (read-only account, shared uhadoop DB) |
-| `ANTHROPIC_API_KEY` | LLM API key |
+| `UHADOOP_MANAGE_HTTP_BASE` | Fallback uhadoop-manage HTTP endpoint (when ZK discovery fails) |
+| `DEEPSEEK_API_KEY` | LLM API key (via modelverse proxy) |
 | `REGION` | Region code for ZK name resolution |
 
 ### Safety Guarantees
 
-- **Read-only DB access**: DiagFlow uses a dedicated read-only MySQL account.
-  The shared uhadoop DB is never mutated (per CLAUDE.md guidance).
-- **No write operations on nodes**: umrAgent calls are restricted to `GetLogs`,
-  `GetAppList` — no `Execute` or restart actions.
+- **No direct MySQL access**: node/cluster metadata comes via the `NodeInfoClient`
+  → uhadoop-manage HTTP API. DiagFlow never touches cluster node tables directly.
+- **No write operations on nodes**: `ssh_exec` commands pass an allowlist + blacklist
+  filter (`config.security`), and umrAgent calls are restricted to `GetLogs`,
+  `CheckProcess`, `GetBaseInfo`, `GetAppList` — no `Execute` or restart actions.
 - **Timeout isolation**: every tool call has a configurable timeout; failures
   degrade gracefully rather than blocking diagnosis.
-- **Audit trail**: every diagnosis produces a full step-by-step trace under
-  `/tmp/diagflow/<event_id>/`.
-
+- **Audit trail**: every diagnosis produces a step-by-step trace; optional MySQL
+  persistence (via `observability/db.py`) records diagnosis history and step logs
+  when the database is reachable.

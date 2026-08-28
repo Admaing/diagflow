@@ -125,10 +125,21 @@ class _ChromaVectorStore:
             return 0
 
     def close(self) -> None:
+        """Release the ChromaDB client and cached collection.
+
+        chromadb.PersistentClient has no public close() in current versions,
+        so this is a best-effort dereference — the intent is to drop references
+        so the embedded process can GC the client. Idempotent.
+        """
         try:
             self._collection = None
-        except Exception:
-            pass
+            if getattr(self, "client", None) is not None:
+                # Some chromadb builds expose a private _system / close hook.
+                stop = getattr(self.client, "close", None)
+                if callable(stop):
+                    stop()
+        except Exception as exc:
+            logger.debug("ChromaDB close cleanup failed", exc_info=True)
 
 
 # ============================================================================

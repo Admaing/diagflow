@@ -32,7 +32,9 @@ class HybridRetriever:
         self.embedder = embedder
         self.rrf_k = rrf_k
         self._bm25: BM25Okapi | None = None
-        self._bm25_corpus: list[str] = []
+        self._bm25_ids: list[str] = []
+        self._bm25_metadatas: list[dict] = []
+        self._bm25_documents: list[str] = []
 
     def search(
         self,
@@ -72,30 +74,52 @@ class HybridRetriever:
         return final
 
     def _bm25_search(self, query: str, n_results: int = 5) -> list[dict[str, Any]]:
-        """BM25 keyword search."""
-        all_cases = self.vector_store.collection.get(include=["documents", "metadatas"])
-        if not all_cases["documents"]:
-            return []
+        """BM25 keyword search using the cached index.
 
-        tokenized_corpus = [doc.lower().split() for doc in all_cases["documents"]]
-        bm25 = BM25Okapi(tokenized_corpus)
+        Falls back to rebuilding the index from the vector store only when it
+        has not been built yet (or was invalidated).
+        """
+        if self._bm25 is None:
+            self._rebuild_from_store()
+
         tokenized_query = query.lower().split()
-        scores = bm25.get_scores(tokenized_query)
+        scores = self._bm25.get_scores(tokenized_query) if self._bm25 else None
+        if scores is None:
+            return []
         top_indices = np.argsort(scores)[::-1][:n_results]
 
+        ids = self._bm25_ids
+        metadatas = self._bm25_metadatas
+        documents = self._bm25_documents
         results = []
         for idx in top_indices:
             if scores[idx] > 0:
                 results.append({
-                    "id": all_cases["ids"][idx],
-                    "document": all_cases["documents"][idx],
-                    "metadata": all_cases["metadatas"][idx],
+                    "id": ids[idx] if idx < len(ids) else "",
+                    "document": documents[idx] if idx < len(documents) else "",
+                    "metadata": metadatas[idx] if idx < len(metadatas) else {},
                     "score": float(scores[idx]),
                 })
         return results
 
+    def _rebuild_from_store(self) -> None:
+        """Rebuild the BM25 index from the vector store's full corpus."""
+        all_cases = self.vector_store.collection.get(include=["documents", "metadatas"])
+        if not all_cases["documents"]:
+            self._bm25 = None
+            self._bm25_ids = []
+            self._bm25_metadatas = []
+            return
+        tokenized_corpus = [doc.lower().split() for doc in all_cases["documents"]]
+        self._bm25 = BM25Okapi(tokenized_corpus)
+        self._bm25_documents = all_cases["documents"]
+        self._bm25_ids = all_cases["ids"]
+        self._bm25_metadatas = all_cases["metadatas"]
+
     def build_index(self, documents: list[str], ids: list[str], metadatas: list[dict]) -> None:
         """Build or rebuild the BM25 index from stored cases."""
         tokenized = [doc.lower().split() for doc in documents]
-        self._bm25 = BM25Okapi(tokenized)
-        self._bm25_corpus = documents
+        self._bm25 = BM25Okapi(tokenized) if tokenized else None
+        self._bm25_documents = documents
+        self._bm25_ids = ids
+        self._bm25_metadatas = metadatas

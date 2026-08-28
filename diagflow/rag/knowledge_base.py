@@ -35,12 +35,25 @@ class KnowledgeBase:
         embedder: Embedder | None = None,
     ):
         self.vector_store = vector_store or VectorStore()
-        self.embedder = embedder or Embedder()
+        if embedder is None:
+            from diagflow.config import get_config
+            cfg = get_config()
+            embedder = Embedder(embedding_dim=cfg.vector_store.embedding_dim)
+        self.embedder = embedder
         self.retriever = HybridRetriever(self.vector_store, self.embedder)
         # {md5_hash: KnownCase}
         self._fingerprints: dict[str, dict[str, Any]] = {}
         # Restore fingerprints from persisted ChromaDB metadata
         self._load_fingerprints()
+
+    @property
+    def _has_real_embeddings(self) -> bool:
+        """True only when the embedder can produce semantically meaningful vectors.
+
+        The hash fallback (no API key) is not semantically meaningful — but it
+        is useless for recall and, if written, pollutes the vector store.
+        """
+        return self.embedder.api_key is not None
 
     # ------------------------------------------------------------------
     # Fingerprint persistence
@@ -133,20 +146,21 @@ class KnowledgeBase:
         )
 
         embedding = self.embedder.embed(case_text)
-        self.vector_store.add_case(
-            case_id=case_id,
-            text=case_text,
-            metadata={
-                "component": component,
-                "error_pattern": error_pattern,
-                "version": version,
-                "fingerprint": fp,
-                "root_cause": root_cause,
-                "suggestions": ",".join(suggestions) if suggestions else "",
-                "created": datetime.now(timezone.utc).isoformat(),
-            },
-            embedding=embedding,
-        )
+        if self._has_real_embeddings:
+            self.vector_store.add_case(
+                case_id=case_id,
+                text=case_text,
+                metadata={
+                    "component": component,
+                    "error_pattern": error_pattern,
+                    "version": version,
+                    "fingerprint": fp,
+                    "root_cause": root_cause,
+                    "suggestions": ",".join(suggestions) if suggestions else "",
+                    "created": datetime.now(timezone.utc).isoformat(),
+                },
+                embedding=embedding,
+            )
 
         self._fingerprints[fp] = {
             "case_id": case_id,
@@ -221,12 +235,13 @@ class KnowledgeBase:
         fp = self.make_fingerprint(component, error_pattern, version)
 
         embedding = self.embedder.embed(body)
-        self.vector_store.add_case(
-            case_id=case_id,
-            text=body,
-            metadata={**meta, "fingerprint": fp},
-            embedding=embedding,
-        )
+        if self._has_real_embeddings:
+            self.vector_store.add_case(
+                case_id=case_id,
+                text=body,
+                metadata={**meta, "fingerprint": fp},
+                embedding=embedding,
+            )
         self._fingerprints[fp] = {
             "case_id": case_id,
             "component": component,
