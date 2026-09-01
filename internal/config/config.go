@@ -64,6 +64,18 @@ type MySQLConfig struct {
 	PoolMax  int
 }
 
+// ServerConfig is the HTTP API server tunables.
+type ServerConfig struct {
+	Port               int
+	ReadHeaderTimeoutS int
+	ReadTimeoutS       int
+	WriteTimeoutS      int
+	IdleTimeoutS       int
+	RequestTimeoutS    int
+	DrainTimeoutS      int
+	MaxBodyBytes       int
+}
+
 // Config is the root config object.
 type Config struct {
 	LLM         LLMConfig
@@ -73,6 +85,7 @@ type Config struct {
 	UmrAgent    UmrAgentConfig
 	Security    SecurityConfig
 	MySQL       MySQLConfig
+	Server      ServerConfig
 
 	LogLevel      string
 	LogFormat     string
@@ -138,6 +151,17 @@ func Default() *Config {
 		Database: "diagflow", PoolMin: 2, PoolMax: 10,
 	}
 
+	c.Server = ServerConfig{
+		Port:               8080,
+		ReadHeaderTimeoutS: 10,
+		ReadTimeoutS:       30,
+		WriteTimeoutS:      300,
+		IdleTimeoutS:       120,
+		RequestTimeoutS:    240,
+		DrainTimeoutS:      30,
+		MaxBodyBytes:       1 << 20,
+	}
+
 	c.LogLevel = "WARNING"
 	c.LogFormat = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
@@ -165,6 +189,33 @@ func Reset() {
 	mu.Lock()
 	defer mu.Unlock()
 	cache = nil
+}
+
+// Validate checks config invariants; returns a list of problems (empty = ok).
+func (c *Config) Validate() []string {
+	var errs []string
+	if c.Server.Port <= 0 || c.Server.Port > 65535 {
+		errs = append(errs, "server.port must be in 1..65535")
+	}
+	if c.Server.RequestTimeoutS <= 0 {
+		errs = append(errs, "server.request_timeout_s must be > 0")
+	}
+	if c.Server.MaxBodyBytes <= 0 {
+		errs = append(errs, "server.max_body_bytes must be > 0")
+	}
+	if c.LLM.Model == "" {
+		errs = append(errs, "llm.model must not be empty")
+	}
+	if c.LLM.MaxTokens <= 0 {
+		errs = append(errs, "llm.max_tokens must be > 0")
+	}
+	if c.LLM.Temperature < 0 || c.LLM.Temperature > 2 {
+		errs = append(errs, "llm.temperature must be in 0..2")
+	}
+	if c.Server.RequestTimeoutS >= c.Server.WriteTimeoutS {
+		errs = append(errs, "server.request_timeout_s should be < server.write_timeout_s")
+	}
+	return errs
 }
 
 // FromEnv builds a Config from environment variables, layered on defaults.
@@ -267,6 +318,17 @@ func applyNested(c *Config, section, field, value string) {
 			c.UmrAgent.Port = atoi(value, c.UmrAgent.Port)
 		case "timeout_s":
 			c.UmrAgent.TimeoutS = atoi(value, c.UmrAgent.TimeoutS)
+		}
+	case "SERVER":
+		switch field {
+		case "port":
+			c.Server.Port = atoi(value, c.Server.Port)
+		case "request_timeout_s":
+			c.Server.RequestTimeoutS = atoi(value, c.Server.RequestTimeoutS)
+		case "drain_timeout_s":
+			c.Server.DrainTimeoutS = atoi(value, c.Server.DrainTimeoutS)
+		case "max_body_bytes":
+			c.Server.MaxBodyBytes = atoi(value, c.Server.MaxBodyBytes)
 		}
 	}
 }

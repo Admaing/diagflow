@@ -38,14 +38,17 @@ func (e *Embedder) EmbedBatch(texts []string) [][]float64 {
 }
 
 // HasRealEmbeddings reports whether we can produce semantically meaningful
-// vectors (i.e. an API key is present).
+// vectors. DEGRADED MODE: the OpenAI embedding call is not yet wired (see
+// openaiEmbed), so this is always false — the KB semantic fast-path in
+// DiagAgent Phase 1 stays disabled and only the deterministic fallback is
+// used. Flip this to true ONLY after wiring a real embedding provider.
 func (e *Embedder) HasRealEmbeddings() bool {
-	return e.APIKey != ""
+	return false
 }
 
-// openaiEmbed is a stub: the OpenAI embedding call requires network; offline
-// demo mode never has an API key so it is not exercised here. When an API key
-// is present this should be wired to the OpenAI API.
+// openaiEmbed is a stub returning the deterministic fallback. TODO: wire a
+// real embedding provider (POST /v1/embeddings) before enabling
+// HasRealEmbeddings.
 func (e *Embedder) openaiEmbed(text string) []float64 {
 	return e.fallbackEmbed(text)
 }

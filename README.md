@@ -1,6 +1,6 @@
 # DiagFlow — AI-Powered Diagnostic Agent for Big Data Platforms
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)]()
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8.svg)]()
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)]()
 
 **DiagFlow** is an AI agent system that automates root cause analysis for big data platform failures. Given a user-reported problem (e.g., "Flink job FAILED", "HDFS no space left"), DiagFlow systematically gathers evidence from logs, metrics, and configuration, then produces a structured diagnosis with actionable suggestions.
@@ -21,7 +21,8 @@ when deterministic logic cannot already answer the question.
                     │                             │
                     │  Phase 1  KB semantic search │ ← 0 LLM
                     │  Phase 2  YAML strategy exec │ ← 0 LLM (parallel by priority)
-                    │  Phase 2.5 MD5 fingerprint   │ ← 0 LLM
+                    │  Phase 2.5 (removed)         │
+                    │  (semantic fast-path only)   │
                     │  Phase 3  SDK ReAct          │ ← LLM (tool_use loop)
                     │  Phase 4  Synthesize + verify│ ← LLM (4-layer validator)
                     │  Phase 5  Auto-index to KB   │ ← 0 LLM (high-confidence only)
@@ -89,7 +90,7 @@ when deterministic logic cannot already answer the question.
 
 ### Prerequisites
 
-- Python 3.11+
+- Go 1.26+
 - `DEEPSEEK_API_KEY` (or `LLM_API_KEY`) for LLM-powered mode; mock mode works without it.
 
 ### Installation
@@ -97,26 +98,50 @@ when deterministic logic cannot already answer the question.
 ```bash
 git clone https://github.com/your-username/diagflow.git
 cd diagflow
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
+go build -o diagflow ./cmd/diagflow
 ```
 
 ### Run Demo
 
 ```bash
 # List available scenarios
-python -m demo.run --list
+./diagflow --list
 
 # Run Flink OOM diagnosis (mock mode — no API key needed)
-python -m demo.run --scenario flink_oom
+./diagflow --scenario flink_oom
 
 # Run with real LLM (via modelverse proxy → DeepSeek)
 export DEEPSEEK_API_KEY=sk-...
-python -m demo.run --scenario flink_oom
+./diagflow --scenario flink_oom
 
 # Run all scenarios
-python -m demo.run --all
+./diagflow --all
 ```
+
+### HTTP API Server (production mode)
+
+```bash
+./diagflow -serve            # listens on :8080 (DIAGFLOW_SERVER__PORT)
+```
+
+Endpoints:
+
+| Method | Path                | Description |
+|--------|---------------------|-------------|
+| GET    | `/healthz`          | Liveness |
+| GET    | `/readyz`           | Readiness |
+| GET    | `/metrics`          | Prometheus metrics |
+| POST   | `/api/v1/diagnose`  | Run a diagnosis |
+| POST   | `/api/v1/investigate` | Intent-driven investigation |
+
+```bash
+curl -s localhost:8080/api/v1/diagnose \
+  -d '{"component":"flink","problem":"Job FAILED","scenario":"flink_oom"}' | jq .
+```
+
+> **Degraded mode note**: semantic KB embeddings are not yet wired; the KB
+> fast-path stays disabled and only deterministic/fingerprint paths run.
+
 
 ## Project Structure
 

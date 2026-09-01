@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS diagnosis_history (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
     event_id        VARCHAR(64) NOT NULL UNIQUE COMMENT '诊断事件唯一ID',
+    session_id      VARCHAR(64) DEFAULT '' COMMENT '会话ID(同一用户多轮对话)',
     component       VARCHAR(32) NOT NULL COMMENT 'flink/hdfs/yarn/kafka',
     problem_type    VARCHAR(64) NOT NULL COMMENT '策略文件名',
     cluster_id      VARCHAR(128) DEFAULT '' COMMENT 'UHadoop集群ID',
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS diagnosis_history (
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_component (component),
+    INDEX idx_session (session_id, id),
     INDEX idx_confidence (confidence),
     INDEX idx_kb_matched (kb_matched),
     INDEX idx_cluster (cluster_id),

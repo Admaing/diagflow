@@ -101,44 +101,77 @@ func sshExecHandler(c cluster.Cluster, nodeName, cmd string) tools.ToolResult {
 }
 
 // ValidateCommand checks that a shell command is read-only and safe.
-// Returns (allowed, reason).
+// Fail-closed: every pipeline/compound segment must start with a command from
+// the strict read-only allowlist, output redirection is rejected outright, and
+// known write-capable argument forms (-delete, -exec, sed -i, ...) are blocked.
 func ValidateCommand(cmd string) (bool, string) {
-	forbidden := []string{"rm ", "shutdown", "reboot", "mv ", "dd ", "mkfs", ">", ">>", "| sh", "$(", "`"}
-	allowed := []string{
-		"cat", "grep", "find", "tail", "head", "ls", "ps",
-		"df", "free", "curl", "du", "wc", "echo", "stat",
-		"ss", "netstat", "ip", "hostname", "uptime", "uname",
-		"awk", "sed", "sort", "uniq", "cut", "tr", "yarn", "pwd",
-	}
-
 	clean := strings.TrimSpace(cmd)
+	if clean == "" {
+		return false, "empty command"
+	}
+	if strings.ContainsAny(clean, "\n\r") {
+		return false, "multi-line commands not allowed"
+	}
 	lower := strings.ToLower(clean)
 
-	for _, f := range forbidden {
-		if strings.Contains(lower, f) {
+	// Redirection / substitution / expansion always rejected.
+	for _, f := range []string{">", "<", "`", "$(", "${", "\\", "\x00"} {
+		if strings.Contains(clean, f) {
 			return false, fmt.Sprintf("Forbidden pattern '%s' in command", f)
 		}
 	}
 
-	fields := strings.Fields(lower)
-	firstWord := ""
-	if len(fields) > 0 {
-		firstWord = fields[0]
-	}
-	if contains(allowed, firstWord) {
-		return true, ""
-	}
-
-	// Allow piped commands whose first segment starts with an allowed word.
-	if strings.Contains(clean, "|") {
-		first := strings.TrimSpace(strings.Split(clean, "|")[0])
-		f := strings.Fields(strings.ToLower(first))
-		if len(f) > 0 && contains(allowed, f[0]) {
-			return true, ""
+	// Split on compound operators and require each segment to be allowlisted.
+	segs := splitSegments(lower)
+	for _, seg := range segs {
+		fields := strings.Fields(seg)
+		if len(fields) == 0 {
+			continue
+		}
+		if !readOnlyAllow[fields[0]] {
+			return false, fmt.Sprintf("Command '%s' not in read-only allowlist", fields[0])
 		}
 	}
 
-	return false, fmt.Sprintf("Command '%s' not in read-only allowlist", firstWord)
+	// Argument-level write primitives.
+	for _, tok := range []string{"-delete", "-exec", "-execdir", "-ok", "-okdir", "chmod", "chown", "kill"} {
+		if containsAnyToken(lower, tok) {
+			return false, fmt.Sprintf("Forbidden argument '%s' in command", tok)
+		}
+	}
+	return true, ""
+}
+
+// readOnlyAllow is the strict read-only command allowlist. Note the deliberate
+// absence of sed/awk/echo/curl: sed -i and awk 'print > "f"' can write files,
+// echo can emit arbitrary content, and curl can upload data out of the host.
+var readOnlyAllow = map[string]bool{
+	"cat": true, "grep": true, "egrep": true, "fgrep": true,
+	"find": true, "tail": true, "head": true, "less": true, "more": true,
+	"ls": true, "stat": true, "du": true, "df": true, "free": true,
+	"ps": true, "top": true, "uptime": true, "uname": true, "hostname": true,
+	"whoami": true, "id": true, "date": true, "pwd": true,
+	"ss": true, "netstat": true, "ip": true,
+	"sort": true, "uniq": true, "cut": true, "tr": true, "wc": true,
+	"jq": true, "column": true,
+	"yarn": true, "hdfs": true, "zkcli": true,
+}
+
+// splitSegments splits a command on ; && || and | (quote-naively — fail-closed:
+// a quoted | yields an extra segment that must itself be allowlisted).
+func splitSegments(cmd string) []string {
+	s := strings.ReplaceAll(cmd, "&&", ";")
+	s = strings.ReplaceAll(s, "||", ";")
+	return strings.FieldsFunc(s, func(r rune) bool { return r == ';' || r == '|' })
+}
+
+func containsAnyToken(s, tok string) bool {
+	for _, f := range strings.Fields(s) {
+		if f == tok {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

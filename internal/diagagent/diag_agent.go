@@ -16,6 +16,7 @@ import (
 
 	"github.com/Admaing/diagflow/internal/config"
 	"github.com/Admaing/diagflow/internal/memory"
+	"github.com/Admaing/diagflow/internal/metrics"
 	"github.com/Admaing/diagflow/internal/rag/vectorstore"
 	"github.com/Admaing/diagflow/internal/strategy"
 	"github.com/Admaing/diagflow/internal/tools"
@@ -42,12 +43,31 @@ type Report struct {
 	Suggestions      []string
 	MatchedKnowledge bool
 	DurationMS       float64
+	LLMCalls         int
+	LLMTokens        int64
 	PhasesRun        []string
 	Trace            *InvestigationTrace
 }
 
 // EventFunc is the streaming trace callback (mirrors on_event).
 type EventFunc func(msg string)
+
+// toolTimeout bounds each individual tool invocation (strategy + ReAct).
+const toolTimeout = 30 * time.Second
+
+var (
+	llmCallsTotal  = metrics.NewCounter("diagflow_llm_calls_total", "LLM calls (ok)")
+	llmErrors      = metrics.NewCounter("diagflow_llm_errors_total", "LLM call errors")
+	llmTokensTotal = metrics.NewCounter("diagflow_llm_tokens_total", "LLM tokens consumed (input+output)")
+	toolCallsTotal = metrics.NewCounter("diagflow_tool_calls_total", "Tool calls by tool/status", "tool", "status")
+)
+
+func statusLabel(success bool) string {
+	if success {
+		return "ok"
+	}
+	return "error"
+}
 
 // Agent is the single diagnostic agent.
 type Agent struct {
@@ -66,6 +86,7 @@ type Agent struct {
 	tools     map[string]tools.Def
 	eventID   string
 	llmCalls  int
+	llmTokens int64
 	stepOrder int
 }
 
@@ -94,6 +115,7 @@ func New(opts ...Option) *Agent {
 		opts := []option.RequestOption{
 			option.WithAPIKey(apiKey),
 			option.WithBaseURL(baseURL),
+			option.WithMaxRetries(3),
 		}
 		a.client = anthropic.NewClient(opts...)
 	}
@@ -206,6 +228,8 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 		Suggestions:      suggestions,
 		MatchedKnowledge: false,
 		DurationMS:       durationMS,
+		LLMCalls:         a.llmCalls,
+		LLMTokens:        a.llmTokens,
 		PhasesRun:        phases,
 	}
 	return report, nil
@@ -289,7 +313,6 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 
 	dryTurns := 0
 	for turns := 0; turns < maxTurns; turns++ {
-		a.llmCalls++
 		params := anthropic.MessageNewParams{
 			Model:       anthropic.Model(a.model),
 			MaxTokens:   a.maxTokens,
@@ -301,7 +324,7 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 			params.Tools = a.schemas()
 		}
 
-		resp, err := a.client.Messages.New(ctx, params)
+		resp, err := a.callLLM(ctx, params)
 		if err != nil {
 			// Degrade gracefully on LLM failure.
 			return fmt.Sprintf("[agent] LLM error: %v", err)
@@ -338,7 +361,12 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 			block := toolUseAsBlock(tu)
 			if tool, ok := a.tools[block.Name]; ok {
 				a.emit(fmt.Sprintf("[react] %s(%s)", block.Name, trunc(string(block.Input), 200)))
-				result, _ := tool.Handler(ctx, jsonInputToMap(block.Input))
+				toolCtx, cancel := context.WithTimeout(ctx, toolTimeout)
+				result, toolErr := tool.Handler(toolCtx, jsonInputToMap(block.Input))
+				cancel()
+				if toolErr != nil {
+					result = tools.ToolResult{Data: "", Success: false, Error: toolErr.Error()}
+				}
 				resultText := result.Data
 				if !result.Success {
 					resultText = result.Error
@@ -371,8 +399,7 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
 				"You've explored for 3 turns without finding new evidence. "+
 					"STOP now and produce a diagnosis with what you HAVE.")))
-			a.llmCalls++
-			final, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+			final, err := a.callLLM(ctx, anthropic.MessageNewParams{
 				Model:       anthropic.Model(a.model),
 				MaxTokens:   a.maxTokens,
 				Temperature: anthropic.Float(0.3),
@@ -403,8 +430,7 @@ func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, conte
 	}
 	prompt += "\n\nCall the report_diagnosis tool with your structured conclusion."
 
-	a.llmCalls++
-	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
 		MaxTokens:   1024,
 		Temperature: anthropic.Float(0.2),
@@ -467,6 +493,14 @@ func (a *Agent) runStrategy(ctx context.Context, strat strategy.Strategy, contex
 			wg.Add(1)
 			go func(s strategy.Step) {
 				defer wg.Done()
+				defer func() {
+					if rec := recover(); rec != nil {
+						pool.Add(memory.NewEvidence("strategy", "panic",
+							fmt.Sprintf("%s panicked: %v", s.Tool, rec),
+							fmt.Sprint(rec), 0.0))
+						a.emit(fmt.Sprintf("[strategy] step %s panicked: %v", s.Tool, rec))
+					}
+				}()
 				a.executeStep(ctx, s, contextData, pool)
 			}(step)
 		}
@@ -502,12 +536,16 @@ func (a *Agent) executeStep(ctx context.Context, step strategy.Step, contextData
 	}
 	params := step.RenderParams(contextData)
 	a.emit(fmt.Sprintf("[strategy] %s(%v)", step.Tool, params))
-	result, err := tool.Handler(ctx, params)
+	toolCtx, cancel := context.WithTimeout(ctx, toolTimeout)
+	defer cancel()
+	result, err := tool.Handler(toolCtx, params)
 	if err != nil {
+		toolCallsTotal.Inc(step.Tool, "error")
 		pool.Add(memory.NewEvidence("strategy", "error",
 			fmt.Sprintf("%s failed: %v", step.Tool, err), err.Error(), 0.0))
 		return
 	}
+	toolCallsTotal.Inc(step.Tool, statusLabel(result.Success))
 	if result.Success {
 		pool.Add(memory.NewEvidence("strategy", "tool:"+step.Tool, trunc(result.Data, 200), result.Data, 0.8))
 	} else {
@@ -528,7 +566,6 @@ func (a *Agent) runLLMDecide(ctx context.Context, step strategy.Step, pool *memo
 		return ""
 	}
 
-	a.llmCalls++
 	enum := make([]any, len(values))
 	for i, v := range values {
 		enum[i] = v
@@ -545,7 +582,7 @@ func (a *Agent) runLLMDecide(ctx context.Context, step strategy.Step, pool *memo
 	prompt := fmt.Sprintf("%s\n\nEvidence collected so far:\n%s\n\nCluster context:\n%s\n\nChoices:\n%s",
 		step.DecidePrompt, pool.Summary(), jsonString(stripTopology(contextData)), choicesDesc.String())
 
-	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
 		MaxTokens:   128,
 		Temperature: anthropic.Float(0.1),
@@ -640,6 +677,22 @@ func (a *Agent) emit(msg string) {
 	if a.onEvent != nil {
 		a.onEvent(msg)
 	}
+}
+
+// callLLM wraps a single LLM request with token accounting and error metrics.
+func (a *Agent) callLLM(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+	a.llmCalls++
+	resp, err := a.client.Messages.New(ctx, params)
+	if err != nil {
+		llmErrors.Inc()
+		return nil, err
+	}
+	llmCallsTotal.Inc()
+	if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+		a.llmTokens += int64(resp.Usage.InputTokens + resp.Usage.OutputTokens)
+		llmTokensTotal.Add(int64(resp.Usage.InputTokens + resp.Usage.OutputTokens))
+	}
+	return resp, nil
 }
 
 func blockToParam(b anthropic.ContentBlockUnion) anthropic.ContentBlockParamUnion {
