@@ -33,6 +33,10 @@ var _ cluster.Cluster = (*Cluster)(nil)
 // EnsureNodeData is a no-op for simulated clusters.
 func (c *Cluster) EnsureNodeData(ctx context.Context) error { return nil }
 
+// SupportsExec reports that the demo adapter accepts read-only ssh_exec calls
+// (they are validated but not actually executed).
+func (c *Cluster) SupportsExec() bool { return true }
+
 // FindNode resolves a node ref (always returns a stub entry for the demo).
 func (c *Cluster) FindNode(ref string) map[string]any {
 	return map[string]any{"node_name": ref, "node_role": ref}
@@ -40,17 +44,33 @@ func (c *Cluster) FindNode(ref string) map[string]any {
 
 // GetNodeLog reads matching lines from a simulated log file.
 func (c *Cluster) GetNodeLog(ctx context.Context, logPath, keywords string, maxLines int) (string, error) {
-	content, ok := c.Scenario.Logs[logPath]
+	// Accept the same "node:path" convention as the real adapter; the node
+	// prefix is ignored because the demo scenario is node-agnostic.
+	_, path, ok := strings.Cut(logPath, ":")
 	if !ok {
-		return "[Simulated] Log file '" + logPath + "' not found on this cluster.", nil
+		path = logPath
+	}
+	content, ok := c.Scenario.Logs[path]
+	if !ok {
+		return "[Simulated] Log file '" + path + "' not found on this cluster.", nil
 	}
 	lines := strings.Split(strings.TrimSpace(content), "\n")
 	if keywords != "" {
-		kw := strings.ToLower(keywords)
+		// "ERROR,Exception,FATAL" → match any keyword, case-insensitively.
+		var kws []string
+		for _, k := range strings.Split(keywords, ",") {
+			if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
+				kws = append(kws, k)
+			}
+		}
 		var kept []string
 		for _, l := range lines {
-			if strings.Contains(strings.ToLower(l), kw) {
-				kept = append(kept, l)
+			low := strings.ToLower(l)
+			for _, k := range kws {
+				if strings.Contains(low, k) {
+					kept = append(kept, l)
+					break
+				}
 			}
 		}
 		lines = kept
@@ -59,7 +79,7 @@ func (c *Cluster) GetNodeLog(ctx context.Context, logPath, keywords string, maxL
 		lines = lines[len(lines)-maxLines:]
 	}
 	if len(lines) == 0 {
-		return "[Simulated] No lines matching '" + keywords + "' in " + logPath, nil
+		return "[Simulated] No lines matching '" + keywords + "' in " + path, nil
 	}
 	return strings.Join(lines, "\n"), nil
 }

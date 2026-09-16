@@ -29,6 +29,7 @@ func (a *Agent) buildInvestigationPlan(ctx context.Context, component string, co
 			"Call the propose_intents tool with your ordered list.",
 		component, jsonString(stripTopology(contextData)),
 	)
+	prompt += languageDirective(a.language)
 
 	intentsTool := &anthropic.ToolParam{
 		Name:        "propose_intents",
@@ -191,7 +192,7 @@ func (a *Agent) dispatchDeepwiki(ctx context.Context, component string, step *In
 func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextData map[string]any) (string, bool) {
 	system := "You are a senior SRE executing a single investigation intent. " +
 		"Use tools to gather the log/metric evidence for this intent. Keep it focused " +
-		"— call at most 4 tools, then stop."
+		"— call at most 4 tools, then stop." + languageDirective(a.language)
 
 	messages := []anthropic.MessageParam{
 		anthropic.NewUserMessage(anthropic.NewTextBlock(
@@ -222,7 +223,7 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 
 		resp, err := a.client.Messages.New(ctx, params)
 		if err != nil {
-			return "LLM error during investigation", false
+			return "排查过程中 LLM 调用失败", false
 		}
 
 		var toolUses []anthropic.ContentBlockUnion
@@ -279,11 +280,11 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 		Model:       anthropic.Model(a.model),
 		MaxTokens:   512,
 		Temperature: anthropic.Float(0.1),
-		System:      []anthropic.TextBlockParam{{Text: "Summarize your judgment for this intent in one sentence."}},
+		System:      []anthropic.TextBlockParam{{Text: "Summarize your judgment for this intent in one sentence." + languageDirective(a.language)}},
 		Messages:    messages,
 	})
 	if err != nil {
-		return "unable to conclude", false
+		return "无法得出结论", false
 	}
 	judgment := firstText(resp)
 	return judgment, suspectBug(judgment)
@@ -322,7 +323,7 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 	intents, err := a.buildInvestigationPlan(ctx, component, contextData)
 	if err != nil {
 		// Fall back to a single default intent if the LLM fails to propose.
-		intents = []intentItem{{Intent: "locate the failing job and collect its error logs"}}
+		intents = []intentItem{{Intent: "定位失败的任务并收集其错误日志"}}
 		a.emit(fmt.Sprintf("[%s] intent proposal failed, using default — %v", a.eventID, err))
 	}
 

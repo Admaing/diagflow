@@ -54,13 +54,6 @@ yarn:
       - /var/log/hadoop/yarn/yarn-yarn-nodemanager-*.log
     process_name: NodeManager
 
-kafka:
-  Broker:
-    node_role: core
-    log_paths:
-      - /var/log/kafka/server.log
-    process_name: Kafka
-
 hbase:
   HMaster:
     node_role: master

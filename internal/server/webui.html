@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiagFlow — 集群诊断</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --fg: #1c1f23; --muted: #656d76;
+    --border: #d8dee4; --accent: #1f6feb; --accent-fg: #fff;
+    --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    --code-bg: #f2f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --panel: #161b22; --fg: #e6edf3; --muted: #8b949e;
+      --border: #30363d; --accent: #2f81f7; --accent-fg: #fff;
+      --ok: #3fb950; --warn: #d29922; --err: #f85149;
+      --code-bg: #0b1017;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.err { background: var(--err); }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px; display: grid; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  /* Jumping to the result must clear the sticky header, otherwise the meta row
+     (event id, confidence, duration) lands underneath it. */
+  #resultCard { scroll-margin-top: 64px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
+  input[type=text], input[type=password], textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--fg); font: inherit; font-size: 13px;
+  }
+  textarea { resize: vertical; min-height: 68px; }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  button {
+    padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--fg); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+    font-weight: 600; border: 1px solid currentColor;
+  }
+  .badge.high { color: var(--ok); } .badge.medium { color: var(--warn); }
+  .badge.low { color: var(--err); } .badge.unknown { color: var(--muted); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  h2 { font-size: 15px; margin: 18px 0 8px; }
+  h2:first-child { margin-top: 0; }
+  ol, ul { padding-left: 22px; margin: 6px 0; }
+  li { margin: 4px 0; }
+  .rootcause { white-space: pre-wrap; word-break: break-word; }
+  details {
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;
+    margin: 6px 0; background: var(--bg);
+  }
+  details > summary { cursor: pointer; font-size: 13px; }
+  details[open] > summary { margin-bottom: 8px; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; overflow: auto; max-height: 420px; font-size: 12px;
+    white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .error { color: var(--err); white-space: pre-wrap; font-size: 13px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  #history { list-style: none; padding: 0; margin: 8px 0 0; max-height: 260px; overflow: auto; }
+  #history li {
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 6px; cursor: pointer; font-size: 13px; background: var(--bg);
+  }
+  #history li:hover { border-color: var(--accent); }
+  #history .h-sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .spinner {
+    width: 13px; height: 13px; border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite; display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Live narration while a diagnosis runs. */
+  #streamCard { scroll-margin-top: 64px; }
+  #stream {
+    margin-top: 10px; max-height: 320px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.7;
+  }
+  #stream .step { display: flex; gap: 10px; padding: 1px 0; }
+  #stream .step .t { color: var(--muted); flex: none; width: 52px; text-align: right; }
+  #stream .step .m { word-break: break-word; }
+  #stream .step .m::before { content: "·"; color: var(--muted); margin-right: 7px; }
+  #stream .tool_call .m { color: var(--accent); }
+  #stream .tool_call .m::before { content: "▸"; }
+  #stream .tool_result .m::before { content: "✓"; color: var(--ok); }
+  #stream .tool_error .m { color: var(--err); }
+  #stream .tool_error .m::before { content: "✗"; color: var(--err); }
+  #stream .phase .m { font-weight: 600; }
+  #stream .phase .m::before { content: "◆"; }
+  #stream .strategy .m { color: var(--muted); }
+  #stream .warn .m { color: var(--warn); }
+  #stream .warn .m::before { content: "!"; color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🩺 DiagFlow 集群诊断</h1>
+  <div class="spacer"></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">检查服务…</span></div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row">
+      <div>
+        <label for="component">组件 *</label>
+        <input id="component" type="text" list="components" placeholder="hdfs / yarn / hive / flink" value="hdfs">
+        <datalist id="components">
+          <option value="hdfs"><option value="yarn"><option value="hive">
+          <option value="hbase"><option value="spark"><option value="zookeeper">
+        </datalist>
+      </div>
+      <div>
+        <label for="cluster">集群 ID *</label>
+        <input id="cluster" type="text" placeholder="uhadoop-xxxxxxxxxxxx" value="uhadoop-1v9waqiylmqj">
+      </div>
+      <div>
+        <label for="token">Bearer Token（服务未启用鉴权时留空）</label>
+        <input id="token" type="password" placeholder="DIAGFLOW_AUTH_TOKEN">
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <label for="problem">问题描述 *</label>
+      <textarea id="problem" placeholder="例如：NameNode 日志有 WARN，集群是否健康"></textarea>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label for="detail">补充信息（可选）</label>
+        <input id="detail" type="text" placeholder="报错原文、时间窗口、作业名…">
+      </div>
+      <div>
+        <label for="investigate">排查模式</label>
+        <select id="investigate">
+          <option value="false">标准诊断（五阶段）</option>
+          <option value="true">意图驱动排查（命中历史则短路）</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="run">开始诊断</button>
+      <span class="hint" id="timer"></span>
+      <span class="hint">⌘/Ctrl + Enter 快捷提交</span>
+    </div>
+  </section>
+
+  <section class="card" id="resultCard" hidden>
+    <div id="result"></div>
+  </section>
+
+  <section class="card" id="streamCard" hidden>
+    <h2 style="margin-top:0">诊断过程</h2>
+    <div class="hint" id="streamHint"></div>
+    <div id="stream"></div>
+  </section>
+
+  <section class="card">
+    <h2 style="margin-top:0">最近诊断</h2>
+    <div class="hint">保存在本浏览器；服务端历史需接入 MySQL 后由后端提供。</div>
+    <ul id="history"></ul>
+    <div class="actions"><button id="clearHistory">清空记录</button></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var LS_TOKEN = "diagflow.token";
+  var LS_HISTORY = "diagflow.history";
+  var running = false;
+
+  $("token").value = localStorage.getItem(LS_TOKEN) || "";
+  $("token").addEventListener("change", function () {
+    localStorage.setItem(LS_TOKEN, $("token").value.trim());
+  });
+
+  function headers() {
+    var h = { "Content-Type": "application/json" };
+    var t = $("token").value.trim();
+    if (t) { h["Authorization"] = "Bearer " + t; }
+    return h;
+  }
+
+  function checkHealth() {
+    fetch("/healthz").then(function (r) {
+      $("dot").className = "dot " + (r.ok ? "ok" : "err");
+      $("statusText").textContent = r.ok ? "服务正常" : "服务异常 (" + r.status + ")";
+    }).catch(function () {
+      $("dot").className = "dot err";
+      $("statusText").textContent = "无法连接服务";
+    });
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function confClass(c) {
+    c = String(c || "").toLowerCase();
+    return (c === "high" || c === "medium" || c === "low") ? c : "unknown";
+  }
+  function confLabel(c) {
+    return { high: "🟢 高", medium: "🟡 中", low: "🔴 低" }[String(c || "").toLowerCase()] || "未知";
+  }
+
+  function renderReport(payload) {
+    var r = payload.report || {};
+    var ev = r.EvidenceSummary || [];
+    var html = "";
+
+    html += '<div class="meta">'
+      + '<span>事件 <code>' + esc(r.EventID) + '</code></span>'
+      + '<span>组件 <b>' + esc(r.Component) + '</b></span>'
+      + '<span>置信度 <span class="badge ' + confClass(r.Confidence) + '">' + confLabel(r.Confidence) + '</span></span>'
+      + (r.DurationMS ? '<span>耗时 ' + (r.DurationMS / 1000).toFixed(1) + 's</span>' : '')
+      + (r.LLMCalls ? '<span>LLM ' + r.LLMCalls + ' 次</span>' : '')
+      + (r.LLMTokens ? '<span>' + r.LLMTokens + ' tokens</span>' : '')
+      + '<span>阶段 ' + esc((r.PhasesRun || []).join(" → ")) + '</span>'
+      + (r.MatchedKnowledge ? '<span>✅ 命中知识库</span>' : '')
+      + '</div>';
+
+    html += "<h2>根因</h2>";
+    html += r.RootCause
+      ? '<div class="rootcause">' + esc(r.RootCause) + "</div>"
+      : '<div class="empty">本轮未得出根因。</div>';
+
+    var sug = r.Suggestions || [];
+    if (sug.length) {
+      html += "<h2>修复建议</h2><ol>";
+      for (var i = 0; i < sug.length; i++) { html += "<li>" + esc(sug[i]) + "</li>"; }
+      html += "</ol>";
+    }
+
+    html += "<h2>证据链 <span class='hint'>(" + ev.length + " 条)</span></h2>";
+    if (!ev.length) {
+      html += '<div class="empty">无证据记录。</div>';
+    } else {
+      for (var j = 0; j < ev.length; j++) {
+        var e = ev[j] || {};
+        var cat = e.category || "";
+        var detail = e.detail || "";
+        html += "<details><summary><b>" + esc(cat) + "</b> — " + esc(String(e.summary || "").slice(0, 160))
+          + ' <span class="hint">conf=' + esc(e.confidence) + "</span></summary>"
+          + "<pre>" + esc(detail) + "</pre></details>";
+      }
+    }
+
+    if (payload.markdown) {
+      html += "<h2>完整报告</h2><details><summary>展开原始 Markdown</summary><pre>"
+        + esc(payload.markdown) + "</pre></details>";
+    }
+    return html;
+  }
+
+  function loadHistory() {
+    try { return JSON.parse(localStorage.getItem(LS_HISTORY) || "[]"); } catch (e) { return []; }
+  }
+  function saveHistory(list) {
+    localStorage.setItem(LS_HISTORY, JSON.stringify(list.slice(0, 20)));
+    renderHistory();
+  }
+  function renderHistory() {
+    var list = loadHistory();
+    var ul = $("history");
+    ul.innerHTML = "";
+    if (!list.length) {
+      ul.innerHTML = '<li class="empty" style="cursor:default;border-style:dashed">还没有诊断记录</li>';
+      return;
+    }
+    list.forEach(function (item, idx) {
+      var li = document.createElement("li");
+      li.innerHTML = '<div><b>' + esc(item.report.Component) + "</b> — "
+        + esc(String(item.report.ProblemType || "").slice(0, 70))
+        + '<div class="h-sub">' + esc(item.report.Confidence || "") + " · "
+        + esc(new Date(item.at).toLocaleString()) + "</div></div>";
+      li.addEventListener("click", function () {
+        $("result").innerHTML = renderReport(item);
+        $("resultCard").hidden = false;
+        $("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      ul.appendChild(li);
+    });
+  }
+
+  function setRunning(on) {
+    running = on;
+    $("run").disabled = on;
+    $("run").innerHTML = on ? '<span class="spinner"></span> 诊断中…' : "开始诊断";
+  }
+
+  // ---- live narration ----
+
+  function clearStream() {
+    $("stream").innerHTML = "";
+    $("streamHint").textContent = "等待第一步…";
+    $("streamCard").hidden = false;
+  }
+
+  function appendStep(ev) {
+    var row = document.createElement("div");
+    row.className = "step " + (ev.kind || "log");
+    var t = document.createElement("span");
+    t.className = "t";
+    t.textContent = ((ev.elapsed_ms || 0) / 1000).toFixed(1) + "s";
+    var m = document.createElement("span");
+    m.className = "m";
+    m.textContent = ev.text || "";
+    row.appendChild(t);
+    row.appendChild(m);
+    var box = $("stream");
+    box.appendChild(row);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // Parses one SSE chunk into its event name and decoded payload. Comment
+  // lines (": ping") carry no data and are ignored by design.
+  function eachSSEChunk(chunk, onEvent) {
+    var name = "message";
+    var data = [];
+    chunk.split("\n").forEach(function (line) {
+      if (line === "" || line.charAt(0) === ":") { return; }
+      if (line.indexOf("event:") === 0) { name = line.slice(6).trim(); return; }
+      if (line.indexOf("data:") === 0) { data.push(line.slice(5).replace(/^ /, "")); }
+    });
+    if (!data.length) { return; }
+    var payload = null;
+    try { payload = JSON.parse(data.join("\n")); } catch (e) { payload = null; }
+    onEvent(name, payload);
+  }
+
+  // Streams a text/event-stream response chunk by chunk. Falls back to reading
+  // the whole body when the browser cannot expose a stream reader, which still
+  // yields every event, just without progressive rendering.
+  function consumeStream(res, onEvent) {
+    if (!res.body || !res.body.getReader || !window.TextDecoder) {
+      return res.text().then(function (text) {
+        text.split("\n\n").forEach(function (c) { eachSSEChunk(c, onEvent); });
+      });
+    }
+    var reader = res.body.getReader();
+    var dec = new TextDecoder();
+    var buf = "";
+    function pump() {
+      return reader.read().then(function (r) {
+        if (r.done) {
+          if (buf) { eachSSEChunk(buf, onEvent); }
+          return;
+        }
+        buf += dec.decode(r.value, { stream: true });
+        var idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          eachSSEChunk(buf.slice(0, idx), onEvent);
+          buf = buf.slice(idx + 2);
+        }
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  function showReport(data) {
+    $("result").innerHTML = renderReport(data);
+    $("resultCard").hidden = false;
+    $("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
+    if (data.report && data.report.EventID) {
+      var list = loadHistory();
+      list.unshift({ at: Date.now(), report: data.report, markdown: data.markdown });
+      saveHistory(list);
+    }
+  }
+
+  function runDiagnosis() {
+    if (running) { return; }
+    var component = $("component").value.trim();
+    var problem = $("problem").value.trim();
+    var cluster = $("cluster").value.trim();
+    if (!component || !problem) {
+      $("result").innerHTML = '<div class="error">组件和问题描述为必填。</div>';
+      $("resultCard").hidden = false;
+      return;
+    }
+    var body = { component: component, problem: problem, cluster_id: cluster };
+    var detail = $("detail").value.trim();
+    if (detail) { body.detail = detail; }
+    if ($("investigate").value === "true") { body.investigate = true; }
+
+    setRunning(true);
+    // Clear any previous message: a stale error ("component and problem are
+    // required") must not sit next to a run that is actually in progress.
+    $("result").innerHTML = '<div class="empty">正在诊断…下方会实时显示采集与推理过程。</div>';
+    $("resultCard").hidden = false;
+    clearStream();
+    var t0 = Date.now();
+    var tick = setInterval(function () {
+      var secs = ((Date.now() - t0) / 1000).toFixed(0);
+      $("timer").textContent = "已用时 " + secs + "s";
+      $("streamHint").textContent = "诊断进行中，已用时 " + secs + "s";
+    }, 500);
+
+    var failure = null;
+    var gotReport = false;
+
+    fetch("/api/v1/diagnose/stream", { method: "POST", headers: headers(), body: JSON.stringify(body) })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (text) {
+            var data;
+            try { data = JSON.parse(text); } catch (e) { data = {}; }
+            throw new Error((data.error && (data.error.message || data.error)) || text || ("HTTP " + res.status));
+          });
+        }
+        return consumeStream(res, function (name, payload) {
+          if (name === "step" && payload) { appendStep(payload); return; }
+          if (name === "report" && payload) { gotReport = true; showReport(payload); return; }
+          if (name === "failed") {
+            failure = new Error((payload && payload.message) || "诊断失败");
+          }
+        }).then(function () {
+          if (failure) { throw failure; }
+          if (!gotReport) { throw new Error("连接中断：未收到诊断结果"); }
+        });
+      })
+      .catch(function (err) {
+        $("result").innerHTML = '<div class="error">诊断失败：' + esc(err.message) + "</div>";
+        $("resultCard").hidden = false;
+      })
+      .finally(function () {
+        clearInterval(tick);
+        $("timer").textContent = "";
+        var steps = $("stream").childElementCount;
+        $("streamHint").textContent = "共 " + steps + " 步，用时 "
+          + ((Date.now() - t0) / 1000).toFixed(1) + "s";
+        setRunning(false);
+      });
+  }
+
+  $("run").addEventListener("click", runDiagnosis);
+  $("problem").addEventListener("keydown", function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { runDiagnosis(); }
+  });
+  $("clearHistory").addEventListener("click", function () { saveHistory([]); });
+
+  checkHealth();
+  renderHistory();
+})();
+</script>
+</body>
+</html>

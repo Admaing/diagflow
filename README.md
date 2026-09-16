@@ -142,6 +142,82 @@ curl -s localhost:8080/api/v1/diagnose \
 > **Degraded mode note**: semantic KB embeddings are not yet wired; the KB
 > fast-path stays disabled and only deterministic/fingerprint paths run.
 
+### Node-log MCP Server (shared by multiple agents)
+
+```bash
+export DIAGFLOW_MCP_TOKENS="diagflow=token1,opsbot=token2"
+export DIAGFLOW_ZK_HOSTS="10.72.136.107:2181,10.72.136.108:2181"
+export DIAGFLOW_ZONE=666003001        # availability-zone id, scopes ZK discovery
+./diagflow-mcp -port 8090
+```
+
+The MCP server is the **single cluster-access gateway**: DiagFlow agents hold
+no cluster credentials, only a bearer token. It exposes, over Streamable HTTP
+(`POST /mcp`, JSON-RPC 2.0), with per-agent bearer-token auth and audit logging.
+
+It has two data planes:
+
+| MCP tool | Backend |
+|----------|---------|
+| `get_cluster_info` | access API `describe_cluster` (via ZooKeeper discovery) |
+| `list_nodes` | access API `list_node` |
+| `get_node_info` | access API `describe_node` (includes per-node services) |
+| `get_cluster_services` | access API `get_cluster_service` |
+| `get_node_log` | read-only SSH `tail`/`grep` on the node |
+| `search_logs` | read-only SSH, fanned out across nodes in parallel |
+| `get_node_metrics` | read-only SSH (`uptime`, `free`, `df`) |
+| `get_base_info` | read-only SSH (`hostname`, `uname`, `nproc`, `free`) |
+| `check_process` | read-only SSH (`ps`) |
+| `query_yarn` | read-only SSH (`yarn application`) |
+| `ssh_exec` | read-only SSH, command allowlist enforced (incl. inline read-only `mysql -e`) |
+
+**Cluster metadata** is discovered, never hard-coded: the server resolves each
+zone's `UHADOOPAccessHTTP` instances under `/NS/uhadoop/set<zone>/` in
+ZooKeeper (protobuf registration payload) and calls the access HTTP action API.
+**Node operations** use the `access_user` + base64 `passwd` that
+`describe_cluster` returns, over SSH to the node's IPv6 address (cluster IPv4
+addresses are not routable from Kubernetes). Credentials never leave the
+server: `passwd` and `access_user` are redacted from every tool result.
+
+Node-log transport is pluggable (`infra.RemoteExec`); the SSH implementation is
+first, so an umrAgent/agent_key transport can be swapped in later without
+changing the tool surface.
+
+**Safety**: every command is assembled from a fixed read-only template
+(`tail`, `grep`, bounded scan) with shell-quoting; `log_path` must match an
+absolute-path allowlist; `ssh_exec` additionally enforces a command allowlist
+and rejects redirection, substitution, and mutating commands. Output is
+truncated and every call is bounded by a timeout.
+
+`ssh_exec` also accepts the `mysql` client so operators can inspect a cluster's
+databases (the Hive metastore, for example) in the same command form. Every
+`mysql` invocation is checked before it reaches a node: it must carry its query
+inline with `-e`/`--execute`, that query must be a single
+`SELECT`/`SHOW`/`DESC`/`EXPLAIN`/`WITH` statement, and writes, DDL,
+multi-statement input, SQL comments, and client flags such as `--init-command`
+are refused. Example: `mysql -h 127.0.0.1 -e "SHOW DATABASES"`.
+
+Point DiagFlow at it and its `query_yarn` / `query_metrics` tools become thin
+MCP clients instead of touching infra directly:
+
+```bash
+export DIAGFLOW_MCP_BASE_URL=http://diagflow-mcp:8090/mcp
+export DIAGFLOW_MCP_TOKEN=token1
+```
+
+Not in this gateway, by design: `deepwiki_query` targets the public
+`mcp.deepwiki.com` MCP server, so it uses its **own** MCP connection (different
+trust/network boundary). It is enabled by default and calls DeepWiki's
+`ask_question` tool:
+
+```bash
+# default: https://mcp.deepwiki.com/mcp
+export DIAGFLOW_DEEPWIKI_MCP_URL=https://mcp.deepwiki.com/mcp
+```
+
+Node operations are read-only by construction: there is no path in the MCP
+server that runs a mutating command.
+
 
 ## Project Structure
 
@@ -227,19 +303,45 @@ Required environment variables (see `deploy/kubernetes/`):
 
 | Variable | Purpose |
 |----------|---------|
-| `DIAGFLOW_MODE=production` | Enable real infrastructure (vs demo) |
-| `ZK_HOSTS` | ZooKeeper connection for service discovery |
-| `UHADOOP_MANAGE_HTTP_BASE` | Fallback uhadoop-manage HTTP endpoint (when ZK discovery fails) |
+| `DIAGFLOW_MODE=production` | Talk to real infrastructure instead of the simulated demo cluster |
+| `DIAGFLOW_REGION` | Region code (falls back to flat `REGION`) |
+| `DIAGFLOW_ZONE` | **Availability zone this instance serves** (falls back to flat `ZONE`); the MCP server uses it as the ZooKeeper set id |
+| `DIAGFLOW_ZK_HOSTS` | ZooKeeper ensemble for service discovery, e.g. `10.72.136.107:2181,...` |
+| `DIAGFLOW_INFRA__ZONE_ENDPOINTS` | `zone1=http://...,zone2=http://...` — per-zone uhadoop-manage endpoints |
+| `UHADOOP_MANAGE_HTTP_BASE` | Global uhadoop-manage endpoint (only used by `direct` discovery mode) |
 | `DEEPSEEK_API_KEY` | LLM API key (via modelverse proxy) |
-| `REGION` | Region code for ZK name resolution |
+| `DIAGFLOW_LLM__LANGUAGE` | Language for LLM-generated report fields (root cause, suggestions, judgments). Defaults to `zh-CN`; set `en` for English |
+
+### Zone-level deployment
+
+DiagFlow is deployed **per availability zone**. An instance is pinned to one
+`(region, zone)` and resolves that zone's infrastructure endpoint; it will
+never silently fall back to another zone's manager. In production, requests must
+carry a `cluster_id`, and `zone` is echoed back by `GET /readyz`:
+
+```bash
+export DIAGFLOW_MODE=production
+export DIAGFLOW_REGION=test03
+export DIAGFLOW_ZONE=test03-01
+export DIAGFLOW_INFRA__ZONE_ENDPOINTS="test03-01=http://uhadoop-manage:20141"
+./diagflow -serve
+
+./diagflow -cluster uhadoop-xxxx --investigate   # CLI, production
+```
+
+The MCP server is zone-scoped too: `DIAGFLOW_ZONE` (the ZooKeeper set id) and
+`DIAGFLOW_ZK_HOSTS` are **required** when starting `diagflow-mcp`.
 
 ### Safety Guarantees
 
-- **No direct MySQL access**: node/cluster metadata comes via the `NodeInfoClient`
-  → uhadoop-manage HTTP API. DiagFlow never touches cluster node tables directly.
-- **No write operations on nodes**: `ssh_exec` commands pass an allowlist + blacklist
-  filter (`config.security`), and umrAgent calls are restricted to `GetLogs`,
-  `CheckProcess`, `GetBaseInfo`, `GetAppList` — no `Execute` or restart actions.
+- **No direct MySQL access**: node/cluster metadata comes from the zone's UHadoop
+  access HTTP action API, discovered via ZooKeeper. DiagFlow never touches
+  cluster node tables directly.
+- **No write operations on nodes**: the MCP server only ever runs read-only
+  commands. Node log/metrics/base-info/process/YARN commands are built from
+  fixed templates; `ssh_exec` runs through a command allowlist that rejects
+  redirection, command substitution, and mutating commands. Credentials are
+  redacted from every tool result.
 - **Timeout isolation**: every tool call has a configurable timeout; failures
   degrade gracefully rather than blocking diagnosis.
 - **Audit trail**: every diagnosis produces a step-by-step trace; optional MySQL

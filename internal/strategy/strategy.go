@@ -273,20 +273,88 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// defaultStrategy is the component-agnostic fallback used when no YAML
+// strategy matches. It must not assume a specific product's directory layout:
+// it inspects the cluster, discovers the logs that actually exist, and then
+// reads them — so the same steps work for Hadoop, HDFS, YARN, Spark or Hive.
 func defaultStrategy(component, problemType string) Strategy {
-	p0, p1, p2 := 0, 1, 2
+	p0, p1, p2, p3 := 0, 1, 2, 3
+	steps := []Step{
+		{Action: "fingerprint_match", Description: "Check known issues first", priority: &p0},
+		{Action: "tool_call", Tool: "get_cluster_info", Description: "Inspect cluster state and installed services",
+			Params: map[string]any{}, priority: &p1},
+		{Action: "tool_call", Tool: "list_logs", Description: "Discover log files instead of guessing paths",
+			Params: map[string]any{}, priority: &p2},
+	}
+	// Fetch the actual error lines before handing over to the model. Listing a
+	// directory is nearly free (~0.4s) but tells the model nothing about what
+	// went wrong, so it used to spend several thinking-mode turns grepping for
+	// itself. Doing it here is deterministic, parallel across nodes, and gives
+	// the ReAct loop real evidence on its first turn.
+	if dir, ok := logDirForComponent(component); ok {
+		steps = append(steps, Step{
+			Action:      "tool_call",
+			Tool:        "search_logs",
+			Description: "Grep the component's own log directory for error signatures",
+			Params: map[string]any{
+				"log_path": dir + "/*.log",
+				"keywords": "ERROR|Exception|FATAL",
+				"roles":    "master,core",
+			},
+			priority: &p2,
+		})
+	}
+	steps = append(steps, Step{
+		Action: "tool_call", Tool: "query_metrics", Description: "Check resource metrics",
+		Params: map[string]any{}, priority: &p3,
+	})
 	return Strategy{
-		Component:   component,
-		ProblemType: problemType,
-		Steps: []Step{
-			{Action: "fingerprint_match", Description: "Check known issues first", priority: &p0},
-			{Action: "tool_call", Tool: "query_node_log", Description: "Scan for errors in main log",
-				Params: map[string]any{"log_path": "jobmanager.log", "keywords": "ERROR,FATAL"}, priority: &p1},
-			{Action: "tool_call", Tool: "query_metrics", Description: "Check resource metrics",
-				Params: map[string]any{}, priority: &p2},
-		},
+		Component:     component,
+		ProblemType:   problemType,
+		Steps:         steps,
 		KnowledgeBase: map[string]any{"fingerprint": true, "semantic_search": true, "bm25_search": true},
 		Validation:    map[string]any{"min_evidence_count": 1},
 		Output:        map[string]any{"suggestions_min": 2, "suggestions_max": 5},
 	}
+}
+
+// componentLogDirs maps a component to its conventional UHadoop log root.
+// It is an ordered list rather than a map: matching is by substring, so the
+// most specific patterns must win ("hadoop-yarn" before "hadoop", or YARN
+// would be sent to the HDFS log directory). Map iteration order is random,
+// which would make that resolution nondeterministic.
+var componentLogDirs = []struct{ match, dir string }{
+	{"hadoop-yarn", "/var/log/hadoop-yarn"},
+	{"resourcemanager", "/var/log/hadoop-yarn"},
+	{"nodemanager", "/var/log/hadoop-yarn"},
+	{"yarn", "/var/log/hadoop-yarn"},
+	{"hadoop-hdfs", "/var/log/hadoop-hdfs"},
+	{"namenode", "/var/log/hadoop-hdfs"},
+	{"datanode", "/var/log/hadoop-hdfs"},
+	{"journalnode", "/var/log/hadoop-hdfs"},
+	{"hdfs", "/var/log/hadoop-hdfs"},
+	{"mapreduce", "/var/log/hadoop-mapreduce"},
+	{"hive", "/var/log/hive"},
+	{"hbase", "/var/log/hbase"},
+	{"spark", "/var/log/spark"},
+	{"zookeeper", "/var/log/zookeeper"},
+	{"flink", "/var/log/flink"},
+	{"hue", "/var/log/hue"},
+	{"livy", "/var/log/livy"},
+	{"hadoop", "/var/log/hadoop-hdfs"},
+}
+
+// logDirForComponent resolves a component name to its log directory.
+func logDirForComponent(component string) (string, bool) {
+	c := strings.ToLower(strings.TrimSpace(component))
+	if c == "" {
+		return "", false
+	}
+	// Tolerate qualified names like "hdfs.namenode" or "hadoop-yarn".
+	for _, e := range componentLogDirs {
+		if strings.Contains(c, e.match) {
+			return e.dir, true
+		}
+	}
+	return "", false
 }

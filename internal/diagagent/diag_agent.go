@@ -5,7 +5,9 @@ package diagagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -75,10 +77,18 @@ type Agent struct {
 	explicitClient bool
 	model          string
 	maxTokens      int64
-	strategiesDir  string
-	kb             KnowledgeBase
-	validator      *validator.Validator
-	onEvent        EventFunc
+	// language is the BCP-47-ish code (e.g. "zh-CN") every LLM-generated,
+	// user-facing field is written in. See languageDirective.
+	language      string
+	strategiesDir string
+	kb            KnowledgeBase
+	validator     *validator.Validator
+	onEvent       EventFunc
+
+	// callLLMHook, when set, replaces the real LLM call. It exists so the
+	// ReAct loop (turn budget, stall detection, finalization) can be tested
+	// without a live model.
+	callLLMHook func(context.Context, anthropic.MessageNewParams) (*anthropic.Message, error)
 
 	errorKeywords []string
 	repositoryMap map[string]string
@@ -93,7 +103,9 @@ type Agent struct {
 // New builds an Agent.
 func New(opts ...Option) *Agent {
 	a := &Agent{
-		model:     "deepseek-v4-flash",
+		// Single source of truth: the default comes from config, so the LLM
+		// model is changed in one place (DIAGFLOW_LLM__MODEL).
+		model:     config.Get().LLM.Model,
 		maxTokens: 4096,
 		validator: validator.New(),
 		tools:     make(map[string]tools.Def),
@@ -101,6 +113,7 @@ func New(opts ...Option) *Agent {
 	cfg := config.Get()
 	a.model = cfg.LLM.Model
 	a.maxTokens = int64(cfg.LLM.MaxTokens)
+	a.language = cfg.LLM.Language
 	a.strategiesDir = cfg.StrategiesDir
 	a.errorKeywords = cfg.RAG.ErrorKeywords
 	a.repositoryMap = cfg.Components.RepoMap
@@ -172,7 +185,7 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 				EventID:          a.eventID,
 				Component:        component,
 				ProblemType:      problemType,
-				RootCause:        strOr(hit["root_cause"], "known issue"),
+				RootCause:        strOr(hit["root_cause"], "已知问题"),
 				Confidence:       "high",
 				EvidenceSummary:  []map[string]any{},
 				Suggestions:      toStrSlice(hit["suggestions"]),
@@ -204,9 +217,19 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 	a.emit(fmt.Sprintf("[%s] Phase 4: synthesis + validation", a.eventID))
 	phases = append(phases, "validate")
 	rootCause, suggestions, confidence := a.synthesize(ctx, pool, contextData, component, problemType, "")
-	if ok, _ := a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
-		a.emit(fmt.Sprintf("[%s] validation failed — retrying", a.eventID))
-		rootCause, suggestions, confidence = a.synthesize(ctx, pool, contextData, component, problemType, "address validation feedback")
+	if ok, feedback := a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
+		a.emit(fmt.Sprintf("[%s] validation failed (%s) — retrying", a.eventID, feedback))
+		rootCause, suggestions, confidence = a.synthesize(ctx, pool, contextData, component, problemType, feedback)
+	}
+	// Synthesis is a best-effort LLM call. If it came back empty (call error,
+	// unsupported request shape, truncated output), fall back to the ReAct
+	// conclusion rather than emitting a report with no root cause at all.
+	if strings.TrimSpace(rootCause) == "" && strings.TrimSpace(agentOutput) != "" {
+		a.emit(fmt.Sprintf("[%s] synthesis empty — falling back to ReAct conclusion", a.eventID))
+		rootCause = trunc(agentOutput, 400)
+		if ok, _ := a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
+			suggestions = []string{"请复核上述已收集的证据后重新诊断。"}
+		}
 	}
 
 	durationMS := float64(time.Since(start).Milliseconds())
@@ -305,13 +328,18 @@ func (a *Agent) kbIndex(rootCause string, suggestions []string, pool *memory.Evi
 
 // runReact mirrors _run_react (SDK ReAct loop with maxTurns + 3-turn stall).
 func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.EvidencePool, contextData map[string]any, maxTurns int) string {
-	system := buildSystemPrompt(evidence, contextData)
+	system := a.buildSystemPrompt(evidence, contextData)
 
 	messages := []anthropic.MessageParam{
 		anthropic.NewUserMessage(anthropic.NewTextBlock(task)),
 	}
 
+	// Convergence state. maxTurns bounds LLM turns, but a single turn can
+	// carry a batch of parallel calls, so track calls and repeats too.
 	dryTurns := 0
+	executed := make(map[string]bool)
+	seenResults := make(map[string]bool)
+	toolCalls := 0
 	for turns := 0; turns < maxTurns; turns++ {
 		params := anthropic.MessageNewParams{
 			Model:       anthropic.Model(a.model),
@@ -356,32 +384,51 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 		messages = append(messages, anthropic.NewAssistantMessage(assistantBlocks...))
 
 		var toolResults []anthropic.ContentBlockParamUnion
-		newEvidence := 0
+		novel := 0
 		for _, tu := range toolUses {
 			block := toolUseAsBlock(tu)
-			if tool, ok := a.tools[block.Name]; ok {
-				a.emit(fmt.Sprintf("[react] %s(%s)", block.Name, trunc(string(block.Input), 200)))
-				toolCtx, cancel := context.WithTimeout(ctx, toolTimeout)
-				result, toolErr := tool.Handler(toolCtx, jsonInputToMap(block.Input))
-				cancel()
-				if toolErr != nil {
-					result = tools.ToolResult{Data: "", Success: false, Error: toolErr.Error()}
-				}
-				resultText := result.Data
-				if !result.Success {
-					resultText = result.Error
-					a.emit(fmt.Sprintf("[react] %s error: %s", block.Name, resultText))
-				} else {
-					a.emit(fmt.Sprintf("[react] %s result: %s", block.Name, trunc(resultText, 200)))
-				}
-				toolResults = append(toolResults,
-					anthropic.NewToolResultBlock(block.ID, resultText, !result.Success))
-				if result.Success && strings.TrimSpace(resultText) != "" {
-					newEvidence++
-				}
-			} else {
+			tool, ok := a.tools[block.Name]
+			if !ok {
 				toolResults = append(toolResults,
 					anthropic.NewToolResultBlock(block.ID, "Unknown tool: "+block.Name, false))
+				continue
+			}
+			// An identical call cannot return anything new: these are
+			// read-only probes against a run that has not changed. Answer it
+			// from the transcript instead of spending another round trip and
+			// another copy of the payload.
+			key := callFingerprint(block.Name, block.Input)
+			if executed[key] {
+				a.emit(fmt.Sprintf("[react] %s skipped: identical call already executed", block.Name))
+				toolResults = append(toolResults,
+					anthropic.NewToolResultBlock(block.ID, duplicateCallNotice, false))
+				continue
+			}
+			executed[key] = true
+			toolCalls++
+
+			a.emit(fmt.Sprintf("[react] %s(%s)", block.Name, trunc(string(block.Input), 200)))
+			toolCtx, cancel := context.WithTimeout(ctx, toolTimeout)
+			result, toolErr := tool.Handler(toolCtx, jsonInputToMap(block.Input))
+			cancel()
+			if toolErr != nil {
+				result = tools.ToolResult{Data: "", Success: false, Error: toolErr.Error()}
+			}
+			resultText := result.Data
+			if !result.Success {
+				resultText = result.Error
+				a.emit(fmt.Sprintf("[react] %s error: %s", block.Name, resultText))
+			} else {
+				a.emit(fmt.Sprintf("[react] %s result: %s", block.Name, trunc(resultText, 200)))
+			}
+			resultText = capToolResult(resultText, maxReActResultChars)
+			toolResults = append(toolResults,
+				anthropic.NewToolResultBlock(block.ID, resultText, !result.Success))
+			if result.Success && strings.TrimSpace(resultText) != "" {
+				if fp := contentFingerprint(resultText); !seenResults[fp] {
+					seenResults[fp] = true
+					novel++
+				}
 			}
 		}
 
@@ -389,31 +436,54 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 			messages = append(messages, anthropic.NewUserMessage(toolResults...))
 		}
 
-		if newEvidence > 0 {
+		// Novelty is judged on the content, not on "the call returned
+		// something". Re-reading the same log returns the same bytes, and
+		// counting that as progress is why the stall rule never fired.
+		if novel > 0 {
 			dryTurns = 0
 		} else {
 			dryTurns++
 		}
 
+		if toolCalls >= maxReActToolCalls {
+			return a.finalize(ctx, system, messages,
+				fmt.Sprintf("Tool-call budget (%d calls) exhausted. STOP calling tools and produce "+
+					"your diagnosis NOW using only the evidence already gathered. State the root "+
+					"cause, your confidence, and what you could not verify.", maxReActToolCalls))
+		}
+
 		if dryTurns >= 3 {
-			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
+			return a.finalize(ctx, system, messages,
 				"You've explored for 3 turns without finding new evidence. "+
-					"STOP now and produce a diagnosis with what you HAVE.")))
-			final, err := a.callLLM(ctx, anthropic.MessageNewParams{
-				Model:       anthropic.Model(a.model),
-				MaxTokens:   a.maxTokens,
-				Temperature: anthropic.Float(0.3),
-				System:      []anthropic.TextBlockParam{{Text: system}},
-				Messages:    messages,
-			})
-			if err != nil {
-				return "Unable to diagnose — insufficient evidence."
-			}
-			return firstText(final)
+					"STOP now and produce a diagnosis with what you HAVE.")
 		}
 	}
 
-	return fmt.Sprintf("[agent] Max turns reached.")
+	// Budget exhausted. Returning a bare "max turns" string throws away every
+	// tool result gathered so far, so force a conclusion instead — same path
+	// as the stall case, just a different nudge.
+	return a.finalize(ctx, system, messages,
+		"Tool-call budget exhausted. STOP calling tools and produce your diagnosis NOW, "+
+			"using only the evidence already gathered. State the root cause, your confidence, "+
+			"and say explicitly what you could not verify.")
+}
+
+// finalize makes one last tool-free LLM call so the run always ends in a
+// diagnosis rather than an empty report.
+func (a *Agent) finalize(ctx context.Context, system string, messages []anthropic.MessageParam, nudge string) string {
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(nudge)))
+	final, err := a.callLLM(ctx, anthropic.MessageNewParams{
+		Model:       anthropic.Model(a.model),
+		MaxTokens:   a.maxTokens,
+		Temperature: anthropic.Float(0.3),
+		System:      []anthropic.TextBlockParam{{Text: system}},
+		Messages:    messages,
+	})
+	if err != nil {
+		a.emit(fmt.Sprintf("[agent] finalize LLM call failed: %v", err))
+		return "证据不足，无法给出诊断结论。"
+	}
+	return firstText(final)
 }
 
 // synthesize mirrors _synthesize (structured output via tool_use).
@@ -425,20 +495,33 @@ func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, conte
 			"=== Context ===\n%s",
 		component, problemType, pool.Summary(), jsonString(stripTopology(contextData)),
 	)
+	prompt += languageDirective(a.language)
 	if feedback != "" {
 		prompt += "\n\n=== Previous validation feedback ===\n" + feedback
 	}
 	prompt += "\n\nCall the report_diagnosis tool with your structured conclusion."
 
+	// deepseek-v4.1-flash runs in thinking mode, which rejects a forced
+	// tool_choice ({"type":"tool"}) with a 400. "any" is accepted and still
+	// guarantees a tool call, so the structured output stays deterministic.
 	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
-		Model:       anthropic.Model(a.model),
-		MaxTokens:   1024,
+		Model: anthropic.Model(a.model),
+		// Thinking-mode models bill their reasoning against max_tokens. A small
+		// budget gets spent entirely on thinking, so the API returns a
+		// tool_use block with an EMPTY input object and stop_reason=max_tokens.
+		// That silently produced a report with no root cause, so give the
+		// synthesiser the same headroom as the ReAct loop.
+		MaxTokens:   a.maxTokens,
 		Temperature: anthropic.Float(0.2),
 		Messages:    []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(prompt))},
-		Tools:       []anthropic.ToolUnionParam{{OfTool: reportDiagnosisTool()}},
-		ToolChoice:  anthropic.ToolChoiceUnionParam{OfTool: &anthropic.ToolChoiceToolParam{Name: "report_diagnosis"}},
+		Tools:       []anthropic.ToolUnionParam{{OfTool: a.reportDiagnosisTool()}},
+		ToolChoice:  anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}},
 	})
-	if err == nil {
+	if err != nil {
+		// Swallowing this turned a hard API rejection into an empty report
+		// with a meaningless fallback root cause. Surface it instead.
+		a.emit(fmt.Sprintf("[agent] synthesis LLM call failed: %v", err))
+	} else {
 		for _, b := range resp.Content {
 			if b.Type == "tool_use" && b.Name == "report_diagnosis" {
 				var args struct {
@@ -449,6 +532,10 @@ func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, conte
 				if json.Unmarshal(b.Input, &args) == nil && args.RootCause != "" && len(args.Suggestions) > 0 {
 					return args.RootCause, args.Suggestions, args.Confidence
 				}
+				// An empty input means the model ran out of output budget
+				// mid-thought; say so instead of looking like "no findings".
+				a.emit(fmt.Sprintf("[agent] synthesis returned an unusable report_diagnosis input (%d bytes, stop_reason=%s)",
+					len(b.Input), resp.StopReason))
 			}
 		}
 	}
@@ -476,7 +563,7 @@ func parseTextFallback(text string) (string, []string, string) {
 		rootCause = trunc(text, 300)
 	}
 	if len(suggestions) == 0 {
-		suggestions = []string{"Review the evidence and re-run diagnosis"}
+		suggestions = []string{"请复核已收集的证据后重新诊断"}
 	}
 	return rootCause, suggestions, confidence
 }
@@ -581,6 +668,7 @@ func (a *Agent) runLLMDecide(ctx context.Context, step strategy.Step, pool *memo
 
 	prompt := fmt.Sprintf("%s\n\nEvidence collected so far:\n%s\n\nCluster context:\n%s\n\nChoices:\n%s",
 		step.DecidePrompt, pool.Summary(), jsonString(stripTopology(contextData)), choicesDesc.String())
+	prompt += languageDirective(a.language)
 
 	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
@@ -647,14 +735,16 @@ func schemaToInputSchema(s map[string]any) anthropic.ToolInputSchemaParam {
 	return inp
 }
 
-func reportDiagnosisTool() *anthropic.ToolParam {
+func (a *Agent) reportDiagnosisTool() *anthropic.ToolParam {
 	return &anthropic.ToolParam{
-		Name:        "report_diagnosis",
-		Description: anthropic.String("Submit the final diagnosis report."),
+		Name: "report_diagnosis",
+		Description: anthropic.String("Submit the final diagnosis report. " +
+			"root_cause and suggestions are shown to a human operator and must be " +
+			"written in the required output language (" + languageName(a.language) + ")."),
 		InputSchema: schemaFromMap(tools.SchemaForObject(map[string]any{
-			"root_cause":         map[string]any{"type": "string"},
+			"root_cause":         map[string]any{"type": "string", "description": "Root cause in " + languageName(a.language)},
 			"confidence":         map[string]any{"type": "string", "enum": []any{"high", "medium", "low"}},
-			"suggestions":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"suggestions":        map[string]any{"type": "array", "items": map[string]any{"type": "string", "description": "Actionable fix in " + languageName(a.language)}},
 			"missing_evidence":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"evidence_citations": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		}, []string{"root_cause", "confidence", "suggestions"})),
@@ -679,12 +769,40 @@ func (a *Agent) emit(msg string) {
 	}
 }
 
+// logLLMError surfaces the provider's own error payload. A generic "%v" hides
+// the reason ("Thinking mode does not support this tool_choice"), which is
+// exactly the detail needed to fix a rejected request.
+func (a *Agent) logLLMError(err error, params anthropic.MessageNewParams) {
+	attrs := []any{
+		"model", a.model,
+		"error", err.Error(),
+		"max_tokens", params.MaxTokens,
+		"tools", len(params.Tools),
+	}
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) {
+		attrs = append(attrs,
+			"status", apiErr.StatusCode,
+			"request_id", apiErr.RequestID,
+			"body", trunc(apiErr.RawJSON(), 800),
+		)
+	}
+	slog.Error("llm call failed", attrs...)
+}
+
 // callLLM wraps a single LLM request with token accounting and error metrics.
 func (a *Agent) callLLM(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
 	a.llmCalls++
+	if a.callLLMHook != nil {
+		return a.callLLMHook(ctx, params)
+	}
 	resp, err := a.client.Messages.New(ctx, params)
 	if err != nil {
 		llmErrors.Inc()
+		// A failed LLM call used to vanish into a degrade path, so a model that
+		// rejects the request shape looked like "the model found nothing".
+		// Log it at ERROR with the API's own status/body.
+		a.logLLMError(err, params)
 		return nil, err
 	}
 	llmCallsTotal.Inc()
@@ -732,7 +850,7 @@ func firstText(resp *anthropic.Message) string {
 	return strings.Join(parts, "\n")
 }
 
-func buildSystemPrompt(evidence *memory.EvidencePool, contextData map[string]any) string {
+func (a *Agent) buildSystemPrompt(evidence *memory.EvidencePool, contextData map[string]any) string {
 	return fmt.Sprintf(
 		"You are a senior SRE diagnosing a big data platform issue.\n\n"+
 			"## Evidence Already Collected (Phase 2 — do NOT re-query)\n%s\n\n"+
@@ -740,7 +858,8 @@ func buildSystemPrompt(evidence *memory.EvidencePool, contextData map[string]any
 			"2. **Standalone**: If no YARN apps, ssh_exec 'find /data -name *flink*.log'.\n"+
 			"3. **DeepWiki**: Verify specific error classes against component repo.\n"+
 			"4. **3-turn rule**: If 3 tool calls find NO new evidence, STOP.\n\n"+
-			"ALWAYS use Keywords='ERROR,Exception,FATAL' on large logs.",
+			"ALWAYS use Keywords='ERROR,Exception,FATAL' on large logs."+
+			languageDirective(a.language),
 		evidence.Summary(),
 	)
 }

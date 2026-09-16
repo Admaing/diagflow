@@ -10,9 +10,13 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/Admaing/diagflow/internal/cluster"
 	"github.com/Admaing/diagflow/internal/config"
 	"github.com/Admaing/diagflow/internal/diagagent"
+	"github.com/Admaing/diagflow/internal/infra"
+	"github.com/Admaing/diagflow/internal/mcpclient"
 	"github.com/Admaing/diagflow/internal/observability/report"
 	"github.com/Admaing/diagflow/internal/observability/store"
 	"github.com/Admaing/diagflow/internal/rag/knowledgebase"
@@ -26,6 +30,7 @@ func main() {
 	serve := flag.Bool("serve", false, "run the HTTP API server instead of the CLI demo")
 	port := flag.Int("port", 0, "HTTP port override (default from DIAGFLOW_SERVER__PORT)")
 	scenario := flag.String("scenario", "flink_oom", "scenario name")
+	clusterID := flag.String("cluster", "", "cluster instance id to diagnose (production mode)")
 	list := flag.Bool("list", false, "list available scenarios")
 	all := flag.Bool("all", false, "run all scenarios")
 	investigate := flag.Bool("investigate", false, "use intent-driven internal investigation")
@@ -44,14 +49,19 @@ func main() {
 	}
 
 	apiKey := config.Get().LLM.APIKey
+	prod := config.Get().IsProduction()
 
 	if *all {
+		if prod {
+			fmt.Fprintln(os.Stderr, "error: -all is demo-only; production diagnoses one cluster")
+			os.Exit(1)
+		}
 		for name := range simulated.Scenarios {
-			runOne(name, apiKey, *investigate)
+			runOne(name, "", apiKey, *investigate)
 		}
 		return
 	}
-	runOne(*scenario, apiKey, *investigate)
+	runOne(*scenario, *clusterID, apiKey, *investigate)
 }
 
 func runServer(portOverride int) {
@@ -99,16 +109,60 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-func runOne(name, apiKey string, investigate bool) {
+// buildClusterAccess wires ZooKeeper discovery for this deployment's zone.
+func buildClusterAccess(cfg *config.Config) (*infra.ClusterAccess, error) {
+	if len(cfg.Infra.ZKHosts) == 0 {
+		return nil, fmt.Errorf("DIAGFLOW_ZK_HOSTS is required in production: " +
+			"cluster endpoints are discovered, not hard-coded")
+	}
+	zone := cfg.ZKZone()
+	if zone == "" {
+		return nil, fmt.Errorf("DIAGFLOW_ZONE is required: this instance is scoped to one availability zone")
+	}
+	return infra.NewZoneClusterAccess(infra.ZKOptions{
+		Hosts:   cfg.Infra.ZKHosts,
+		Root:    cfg.ZKRootOr(infra.DefaultZKRoot),
+		ZoneID:  zone,
+		Timeout: time.Duration(cfg.Infra.ZKTimeoutS) * time.Second,
+	}), nil
+}
+
+func runOne(scenario, clusterID, apiKey string, investigate bool) {
 	ctx := context.Background()
 
-	c, err := simulated.NewCluster(name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	cfg := config.Get()
+	var c cluster.Cluster
+	var err error
+	if cfg.IsProduction() {
+		if clusterID == "" {
+			fmt.Fprintln(os.Stderr, "error: -cluster is required in production mode")
+			os.Exit(1)
+		}
+		access, rerr := buildClusterAccess(cfg)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", rerr)
+			os.Exit(1)
+		}
+		defer access.Close()
+		real := infra.NewRealCluster(clusterID, cfg.Region, cfg.Zone, access, infra.NewSSHExec())
+		if eerr := real.EnsureNodeData(ctx); eerr != nil {
+			fmt.Fprintf(os.Stderr, "error: resolve cluster %s: %v\n", clusterID, eerr)
+			os.Exit(1)
+		}
+		c = real
+	} else {
+		c, err = simulated.NewCluster(scenario)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	fmt.Printf("\n%s\n🔍 %s\n%s\n", strings.Repeat("=", 50), name, strings.Repeat("=", 50))
+	label := scenario
+	if cfg.IsProduction() {
+		label = clusterID + " (" + cfg.Region + "/" + cfg.Zone + ")"
+	}
+	fmt.Printf("\n%s\n🔍 %s\n%s\n", strings.Repeat("=", 50), label, strings.Repeat("=", 50))
 	fmt.Println(c.Summary())
 
 	if apiKey == "" {
@@ -118,10 +172,19 @@ func runOne(name, apiKey string, investigate bool) {
 
 	store := vectorstore.NewMemory()
 	kb := knowledgebase.New(store)
-	defs := v3tools.BuildV3Tools(c, kb)
+	mcpCfg := cfg.MCP
+	var mcp *mcpclient.Client
+	if mcpCfg.BaseURL != "" {
+		mcp = mcpclient.New(mcpCfg.BaseURL, mcpCfg.Token)
+	}
+	var deepwiki *mcpclient.Client
+	if cfg.DeepWiki.MCPURL != "" {
+		deepwiki = mcpclient.New(cfg.DeepWiki.MCPURL, "")
+	}
+	defs := v3tools.BuildV3Tools(c, kb, mcp, deepwiki)
 
 	agent := diagagent.New(
-		diagagent.WithModel("deepseek-v4-flash"),
+		diagagent.WithModel(cfg.LLM.Model),
 		diagagent.WithKB(kb),
 		diagagent.WithEventFunc(func(msg string) { fmt.Printf("  📋 %s\n", msg) }),
 	)

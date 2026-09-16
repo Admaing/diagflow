@@ -1,0 +1,21 @@
+# Local/runtime artifacts not needed to build the Go binaries.
+.venv/
+.git/
+.github/
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+# Dead Python implementation kept on disk but unused by the Go build.
+diagflow/
+demo/
+# Kubernetes manifests are not part of the image.
+deploy/kubernetes/
+*.tar.gz
+*.zip
+resume_star.md
+.DS_Store

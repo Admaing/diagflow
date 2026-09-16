@@ -9,11 +9,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -107,167 +107,204 @@ func Sign(params map[string]string, key string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// NodeInfoClient fetches cluster/node metadata from uhadoop-manage HTTP API.
-// NO direct MySQL.
-type NodeInfoClient struct {
-	BaseURL string
-	Region  string
-	client  *http.Client
-}
-
-// NewNodeInfoClient builds a node info client for an uhadoop-manage base URL.
-func NewNodeInfoClient(baseURL, region string) *NodeInfoClient {
-	return &NodeInfoClient{BaseURL: baseURL, Region: region, client: &http.Client{Timeout: 15 * time.Second}}
-}
-
-// DescribeCluster fetches cluster info + nodes in one call.
-func (c *NodeInfoClient) DescribeCluster(ctx context.Context, instanceID string) (map[string]any, error) {
-	payload := fmt.Sprintf(`{"Action":"describe_cluster_nodes","instance_id":%q,"region":%q}`,
-		instanceID, c.Region)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/",
-		strings.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("uhadoop-manage HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Parse JSON into a map.
-	var data map[string]any
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
-	}
-	if retCode, ok := data["RetCode"].(float64); ok && retCode != 0 {
-		return nil, fmt.Errorf("uhadoop-manage error: %v", data["Error"])
-	}
-	return data, nil
-}
-
 // RealCluster is the production cluster adapter (implements cluster.Cluster).
+// Cluster metadata comes from the zone's UHadoop access API (resolved through
+// ZooKeeper); node operations go over read-only SSH using the credential the
+// access API returns. No uhadoop-manage URL is hard-coded anywhere.
 type RealCluster struct {
 	InstanceID string
-	NodeClient *NodeInfoClient
-	Agent      *UmrAgentClient
+	Region     string
+	Zone       string
+	Access     *ClusterAccess
+	Exec       RemoteExec
+	Logs       *LogReader
 
-	clusterInfo map[string]any
-	nodes       []map[string]any
+	clusterInfo *ClusterInfo
+	nodeInfos   []NodeInfo
 	context     map[string]any
 }
 
 // Verify compile-time interface satisfaction.
 var _ cluster.Cluster = (*RealCluster)(nil)
 
-// NewRealCluster builds a real cluster adapter.
-func NewRealCluster(instanceID string, nodeClient *NodeInfoClient, agent *UmrAgentClient) *RealCluster {
-	if agent == nil {
-		agent = NewUmrAgentClient()
+// NewRealCluster builds a real cluster adapter over an access client and a
+// remote executor (SSH today, umrAgent later).
+func NewRealCluster(instanceID, region, zone string, access *ClusterAccess, exec RemoteExec) *RealCluster {
+	if exec == nil {
+		exec = NewSSHExec()
 	}
 	return &RealCluster{
 		InstanceID: instanceID,
-		NodeClient: nodeClient,
-		Agent:      agent,
-		context:    map[string]any{"cluster_id": instanceID},
+		Region:     region,
+		Zone:       zone,
+		Access:     access,
+		Exec:       exec,
+		Logs:       &LogReader{Exec: exec},
+		context: map[string]any{
+			"cluster_id": instanceID,
+			"region":     region,
+			"zone":       zone,
+		},
 	}
 }
 
-// EnsureNodeData lazily loads node metadata from the Go API.
+// EnsureNodeData lazily loads cluster + node metadata from the access API.
 func (c *RealCluster) EnsureNodeData(ctx context.Context) error {
-	if c.nodes != nil {
+	if c.clusterInfo != nil {
 		return nil
 	}
-	if c.NodeClient == nil {
-		return fmt.Errorf("no node client configured")
+	if c.Access == nil {
+		return fmt.Errorf("no cluster access configured (set DIAGFLOW_ZK_HOSTS)")
 	}
-	data, err := c.NodeClient.DescribeCluster(ctx, c.InstanceID)
+	info, err := c.Access.DescribeCluster(ctx, c.InstanceID)
 	if err != nil {
 		return err
 	}
-	c.clusterInfo, _ = data["cluster_info"].(map[string]any)
-	if rawNodes, ok := data["nodes"].([]any); ok {
-		for _, n := range rawNodes {
-			if m, ok := n.(map[string]any); ok {
-				c.nodes = append(c.nodes, m)
-			}
-		}
-	}
+	c.clusterInfo = info
+	c.nodeInfos = info.NodeInfo
 	return nil
 }
 
-// FindNode resolves a node reference to a node entry.
+// ClusterInfo returns the loaded cluster metadata (nil before EnsureNodeData).
+func (c *RealCluster) ClusterInfo() *ClusterInfo { return c.clusterInfo }
+
+// FindNode resolves a node reference to a node entry. The returned map keeps
+// both the new key names and the legacy ones used by older call sites.
 func (c *RealCluster) FindNode(ref string) map[string]any {
-	for _, n := range c.nodes {
-		if strOr(n["node_name"], "") == ref || strOr(n["node_role"], "") == ref {
-			return n
-		}
+	node, err := FindNode(c.nodeInfos, ref)
+	if err != nil {
+		return nil
 	}
-	if len(c.nodes) > 0 {
-		return c.nodes[0]
-	}
-	return nil
+	return nodeToMap(*node)
 }
 
-// GetNodeLog fetches a node log via umrAgent (no SSH).
+// nodeToMap renders a NodeInfo as the map shape the tool layer expects.
+func nodeToMap(n NodeInfo) map[string]any {
+	m := map[string]any{
+		"node_id":     n.NodeID,
+		"node_name":   n.NodeName,
+		"node_role":   n.NodeType,
+		"node_type":   n.NodeType,
+		"ip":          n.NodeIP,
+		"node_ip":     n.NodeIP,
+		"ipv6":        n.NodeIPv6,
+		"node_ipv6":   n.NodeIPv6,
+		"access_user": n.AccessUser,
+		"passwd":      n.Passwd,
+		"agent_key":   n.AgentKey,
+		"node_state":  n.NodeState.Int(),
+	}
+	if len(n.ServiceName) > 0 {
+		m["service_name"] = n.ServiceName
+	}
+	return m
+}
+
+// nodeHost returns the address to reach a node on: IPv6 when available (the
+// cluster's IPv4 range is not routable from Kubernetes), else IPv4.
+func nodeHost(n NodeInfo) string {
+	if n.NodeIPv6 != "" {
+		return n.NodeIPv6
+	}
+	return n.NodeIP
+}
+
+// resolveNodeMeta loads node data and resolves a reference.
+func (c *RealCluster) resolveNodeMeta(ctx context.Context, ref string) (*NodeInfo, error) {
+	if err := c.EnsureNodeData(ctx); err != nil {
+		return nil, err
+	}
+	return FindNode(c.nodeInfos, ref)
+}
+
+// credentialFor returns the SSH credential for a node, borrowing the
+// cluster-level password when the node record does not carry one.
+func (c *RealCluster) credentialFor(ctx context.Context, node *NodeInfo) (Credential, error) {
+	if cred, err := CredentialFor(*node); err == nil {
+		return cred, nil
+	}
+	if c.Access == nil {
+		return Credential{}, fmt.Errorf("no cluster access configured")
+	}
+	return c.Access.CredentialFor(ctx, c.InstanceID, node)
+}
+
+// GetNodeLog fetches a node log over read-only SSH. logPath may carry a node
+// prefix ("master1:/var/log/x.log"); otherwise the first master is used.
 func (c *RealCluster) GetNodeLog(ctx context.Context, logPath, keywords string, maxLines int) (string, error) {
-	if err := c.EnsureNodeData(ctx); err != nil {
+	ref, filename, ok := strings.Cut(logPath, ":")
+	if !ok || !strings.HasPrefix(filename, "/") {
+		ref, filename = "", logPath
+	}
+	node, err := c.resolveNodeMeta(ctx, ref)
+	if err != nil {
 		return "", err
 	}
-	nodeRef, filename, _ := strings.Cut(logPath, ":")
-	if filename == "" {
-		filename = logPath
+	if c.Logs == nil {
+		return "", fmt.Errorf("no node log transport configured")
 	}
-	node := c.FindNode(nodeRef)
-	if node == nil {
-		return "", fmt.Errorf("node '%s' not found", nodeRef)
+	cred, err := c.credentialFor(ctx, node)
+	if err != nil {
+		return "", err
 	}
-	ipv6 := strOr(node["ipv6"], "")
-	agentKey := agentKeyOf(node)
-	return c.Agent.Call(ctx, ipv6, agentKey, "GetLogs", map[string]string{
-		"Path":     filename,
-		"Keywords": keywords,
-		"MaxLines": itoa(maxLines),
-	})
+	return c.Logs.ReadLog(ctx, nodeHost(*node), cred, filename, keywords, maxLines)
 }
 
-// GetConfig fetches a config file via umrAgent (uses agent_key or umr_agent_key).
+// GetConfig reads a file from the cluster's first master over read-only SSH.
 func (c *RealCluster) GetConfig(ctx context.Context, configPath string) (string, error) {
-	if err := c.EnsureNodeData(ctx); err != nil {
+	if !configPathRe.MatchString(configPath) || hasDotDotSegment(configPath) {
+		return "", fmt.Errorf("unsafe config path %q", configPath)
+	}
+	node, err := c.resolveNodeMeta(ctx, "")
+	if err != nil {
 		return "", err
 	}
-	master := c.FindNode("master1")
-	if master == nil {
-		return "", fmt.Errorf("no master node in cluster %s", c.InstanceID)
+	cred, err := c.credentialFor(ctx, node)
+	if err != nil {
+		return "", err
 	}
-	return c.Agent.Call(ctx, strOr(master["ipv6"], ""), agentKeyOf(master), "GetLogs", map[string]string{
-		"Path": configPath,
-	})
+	return c.Exec.Run(ctx, nodeHost(*node), cred, "cat -- "+shellQuote(configPath))
 }
 
-// GetMetrics fetches metrics via monitor (production placeholder).
+// GetMetrics fetches a resource snapshot over read-only SSH.
 func (c *RealCluster) GetMetrics(ctx context.Context, metricNames []string) (string, error) {
-	return "[Production] Metrics require service discovery configured", nil
+	node, err := c.resolveNodeMeta(ctx, "")
+	if err != nil {
+		return "", err
+	}
+	cred, err := c.credentialFor(ctx, node)
+	if err != nil {
+		return "", err
+	}
+	const cmd = "uptime; echo '--- load'; cat /proc/loadavg; echo '--- mem'; free -m; echo '--- disk'; df -h"
+	return c.Exec.Run(ctx, nodeHost(*node), cred, cmd)
 }
 
 // Context returns the cluster context.
 func (c *RealCluster) Context() map[string]any { return c.context }
+
+// SupportsExec reports false: the local (non-MCP) exec path is not used for
+// production clusters; node commands go through the MCP gateway instead.
+func (c *RealCluster) SupportsExec() bool { return false }
 
 // ExpectedRootCause is meaningless in production.
 func (c *RealCluster) ExpectedRootCause() string { return "" }
 
 // Summary renders a human-readable summary.
 func (c *RealCluster) Summary() string {
-	return fmt.Sprintf("RealCluster(instance_id=%s, nodes=%d)", c.InstanceID, len(c.nodes))
+	name := c.InstanceID
+	if c.clusterInfo != nil && c.clusterInfo.InstanceName != "" {
+		name = c.InstanceID + " (" + c.clusterInfo.InstanceName + ")"
+	}
+	state := "unknown"
+	if c.clusterInfo != nil {
+		state = ClusterStateName(c.clusterInfo.ClusterState.Int())
+	}
+	return fmt.Sprintf("RealCluster(instance_id=%s, state=%s, nodes=%d)", name, state, len(c.nodeInfos))
 }
+
+// configPathRe restricts config paths read by GetConfig.
+var configPathRe = regexp.MustCompile(`^/[A-Za-z0-9._@/+-]*$`)
 
 // agentKeyOf applies the same compat lookup as get_node_log: either agent_key
 // or umr_agent_key.

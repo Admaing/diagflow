@@ -113,3 +113,52 @@ func intPtr(n int) *int { return &n }
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
+
+// Component names arrive in several shapes; YARN must never resolve to the
+// HDFS log directory just because "hadoop" appears in its name.
+func TestLogDirForComponent(t *testing.T) {
+	cases := map[string]string{
+		"hdfs":            "/var/log/hadoop-hdfs",
+		"HDFS":            "/var/log/hadoop-hdfs",
+		"hadoop-hdfs":     "/var/log/hadoop-hdfs",
+		"hdfs.namenode":   "/var/log/hadoop-hdfs",
+		"namenode":        "/var/log/hadoop-hdfs",
+		"yarn":            "/var/log/hadoop-yarn",
+		"hadoop-yarn":     "/var/log/hadoop-yarn",
+		"resourcemanager": "/var/log/hadoop-yarn",
+		"hive":            "/var/log/hive",
+		"zookeeper":       "/var/log/zookeeper",
+	}
+	for in, want := range cases {
+		got, ok := logDirForComponent(in)
+		if !ok || got != want {
+			t.Errorf("logDirForComponent(%q) = %q,%v want %q", in, got, ok, want)
+		}
+	}
+	if _, ok := logDirForComponent("somethingelse"); ok {
+		t.Error("unknown component must not resolve")
+	}
+}
+
+// The default strategy must fetch real log content, not just list directories.
+func TestDefaultStrategyFetchesLogContent(t *testing.T) {
+	s := defaultStrategy("hdfs", "NameNode WARN")
+	var found bool
+	for _, st := range s.Steps {
+		if st.Tool == "search_logs" {
+			found = true
+			if p := st.Params["log_path"]; p != "/var/log/hadoop-hdfs/*.log" {
+				t.Errorf("search_logs log_path = %v", p)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("default strategy must grep the component's logs")
+	}
+	// Unknown components must not gain a step that would fail.
+	for _, st := range defaultStrategy("whatever", "x").Steps {
+		if st.Tool == "search_logs" {
+			t.Fatal("unknown component must not get a search_logs step")
+		}
+	}
+}

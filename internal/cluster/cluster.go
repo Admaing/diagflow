@@ -19,6 +19,11 @@ type Cluster interface {
 	GetMetrics(ctx context.Context, metricNames []string) (string, error)
 	// Context returns the diagnosis context map.
 	Context() map[string]any
+	// Summary renders a human-readable one-line cluster summary.
+	Summary() string
+	// SupportsExec reports whether read-only shell exec is meaningful for this
+	// adapter. Real clusters use umrAgent (not SSH), so it is false there.
+	SupportsExec() bool
 	// ExpectedRootCause returns the scenario's expected root cause (simulated only).
 	ExpectedRootCause() string
 }

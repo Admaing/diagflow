@@ -27,8 +27,16 @@ data/cases/
 .idea/
 .DS_Store
 
+# Local agent tooling + personal notes — keep on disk, never publish
+.claude/
+resume_star.md
+
 # ChromaDB
 /tmp/diagflow/
+
+# Go build artifacts (binaries built into the repo root)
+/diagflow
+/diagflow-mcp
 /chroma-data/
 
 # Stray files — kept on disk but not committed
