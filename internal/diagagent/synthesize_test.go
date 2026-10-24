@@ -28,8 +28,11 @@ func TestSynthesizeRequestsAnyToolChoice(t *testing.T) {
 		return m, nil
 	}
 
-	rootCause, suggestions, confidence := a.synthesize(context.Background(),
+	rootCause, suggestions, confidence, err := a.synthesize(context.Background(),
 		&memory.EvidencePool{}, map[string]any{}, "hdfs", "NameNode WARN", "")
+	if err != nil {
+		t.Fatalf("unexpected synthesis error: %v", err)
+	}
 
 	if got.OfTool != nil || got.OfAny == nil {
 		t.Fatalf("expected OfAny tool_choice, got %+v", got)
@@ -39,8 +42,8 @@ func TestSynthesizeRequestsAnyToolChoice(t *testing.T) {
 	}
 }
 
-// A failing synthesis call must not be swallowed: the caller falls back to the
-// ReAct conclusion so the report still carries a root cause.
+// A failing synthesis call must be returned as a typed dependency error; it is
+// not a diagnosis and must never be rendered as one.
 func TestSynthesizeReportsCallError(t *testing.T) {
 	a := New(WithModel("test-model"))
 	a.callLLMHook = func(context.Context, anthropic.MessageNewParams) (*anthropic.Message, error) {
@@ -49,10 +52,13 @@ func TestSynthesizeReportsCallError(t *testing.T) {
 
 	var events []string
 	a.onEvent = func(msg string) { events = append(events, msg) }
-	rootCause, _, _ := a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
+	rootCause, _, _, err := a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
 
 	if rootCause != "" {
 		t.Fatalf("expected empty root cause on LLM failure, got %q", rootCause)
+	}
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("expected ErrLLMUnavailable, got %v", err)
 	}
 	if !strings.Contains(strings.Join(events, "\n"), "synthesis LLM call failed") {
 		t.Fatalf("expected the failure to be surfaced, events: %v", events)
@@ -74,7 +80,7 @@ func TestSynthesizeGivesThinkingEnoughBudget(t *testing.T) {
 		})
 		return m, nil
 	}
-	a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
+	_, _, _, _ = a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
 	if got < 4096 {
 		t.Fatalf("synthesize budget %d is too small for a thinking model", got)
 	}
@@ -93,10 +99,29 @@ func TestSynthesizeReportsTruncatedToolInput(t *testing.T) {
 	}
 	var events []string
 	a.onEvent = func(msg string) { events = append(events, msg) }
-	if rc, _, _ := a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", ""); rc != "" {
+	if rc, _, _, err := a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", ""); rc != "" || !errors.Is(err, ErrNoConclusion) {
 		t.Fatalf("expected empty root cause, got %q", rc)
 	}
 	if !strings.Contains(strings.Join(events, "\n"), "unusable report_diagnosis input") {
 		t.Fatalf("expected a truncation warning, events: %v", events)
+	}
+}
+
+// An unstructured or empty text response is not a diagnosis. This is the path
+// that previously turned a provider/network error into a "medium confidence"
+// root cause.
+func TestSynthesizeRejectsArbitraryText(t *testing.T) {
+	a := New(WithModel("test-model"))
+	a.callLLMHook = func(context.Context, anthropic.MessageNewParams) (*anthropic.Message, error) {
+		return &anthropic.Message{Content: []anthropic.ContentBlockUnion{{
+			Type: "text", Text: "[agent] LLM error: 403 Forbidden",
+		}}}, nil
+	}
+	rootCause, _, _, err := a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
+	if rootCause != "" {
+		t.Fatalf("arbitrary text leaked into root cause: %q", rootCause)
+	}
+	if !errors.Is(err, ErrNoConclusion) {
+		t.Fatalf("expected ErrNoConclusion, got %v", err)
 	}
 }

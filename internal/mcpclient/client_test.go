@@ -71,6 +71,22 @@ func TestExtractJSONPayloadSSE(t *testing.T) {
 	}
 }
 
+func TestHealthUsesGatewayHealthz(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL+"/mcp", "tok").Health(context.Background()); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if gotPath != "/healthz" {
+		t.Fatalf("path = %q, want /healthz", gotPath)
+	}
+}
+
 // DeepWiki (and Streamable-HTTP MCP servers generally) answer with SSE.
 func TestCallToolParsesSSE(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

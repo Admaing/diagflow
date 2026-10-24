@@ -134,12 +134,12 @@ func (s *Server) handleDiagnoseStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) finishStream(ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
 	req *DiagnoseRequest, res diagResult, start time.Time) {
 	durationMS := float64(time.Since(start).Milliseconds())
-	diagTotal.Inc(req.Component, statusFor(res.err))
+	diagTotal.Inc(req.Component, diagnosisStatus(res.err, res.report))
 
 	if res.err != nil {
 		msg := truncateErr(res.err)
 		s.log.Error("diagnosis failed", "component", req.Component, "problem", req.Problem, "error", res.err)
-		writeSSE(w, flusher, sseFailed, map[string]any{"message": msg})
+		writeSSE(w, flusher, sseFailed, map[string]any{"message": msg, "code": diagnosisErrorCode(res.err)})
 		writeSSE(w, flusher, sseDone, map[string]any{"duration_ms": durationMS})
 		return
 	}

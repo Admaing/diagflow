@@ -15,6 +15,8 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -47,18 +49,51 @@ type Server struct {
 	tokens    map[string]string // token → agent name
 	fanout    int               // max concurrent node operations
 	callTotal *metrics.Counter
+	callDur   *metrics.Histogram
+	rejected  *metrics.Counter
+
+	acl            ACL
+	limiter        *rateLimiter
+	maxSearchNodes int
+}
+
+// Option configures the server.
+type Option func(*Server)
+
+// WithACL restricts which clusters each agent may query. nil = unrestricted.
+func WithACL(acl ACL) Option { return func(s *Server) { s.acl = acl } }
+
+// WithRateLimit enables a per-agent token bucket for tools/call.
+func WithRateLimit(rps float64, burst int) Option {
+	return func(s *Server) { s.limiter = newRateLimiter(rps, burst) }
+}
+
+// WithMaxSearchNodes caps how many nodes one search_logs call fans out to.
+func WithMaxSearchNodes(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.maxSearchNodes = n
+		}
+	}
 }
 
 // New builds an MCP server. tokens maps bearer token → agent identity (used
-// for auth and audit).
-func New(log *slog.Logger, ds DataSource, tokens map[string]string) *Server {
-	return &Server{
-		log:       log,
-		ds:        ds,
-		tokens:    tokens,
-		fanout:    8,
-		callTotal: metrics.NewCounter("mcp_tool_calls_total", "MCP tool calls by agent/tool/status", "agent", "tool", "status"),
+// for auth, ACL and audit).
+func New(log *slog.Logger, ds DataSource, tokens map[string]string, opts ...Option) *Server {
+	s := &Server{
+		log:            log,
+		ds:             ds,
+		tokens:         tokens,
+		fanout:         8,
+		maxSearchNodes: 32,
+		callTotal:      metrics.NewCounter("mcp_tool_calls_total", "MCP tool calls by agent/tool/status", "agent", "tool", "status"),
+		callDur:        metrics.NewHistogram("mcp_tool_duration_ms", "MCP tool call wall time in milliseconds"),
+		rejected:       metrics.NewCounter("mcp_rejected_total", "MCP requests rejected before execution", "reason"),
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // ---- MCP protocol ----
@@ -68,8 +103,9 @@ type rpcRequest struct {
 	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method"`
 	Params  struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+		Name            string          `json:"name"`
+		Arguments       json.RawMessage `json:"arguments"`
+		ProtocolVersion string          `json:"protocolVersion"`
 	} `json:"params"`
 }
 
@@ -91,21 +127,38 @@ func idOrNull(id json.RawMessage) any {
 
 var protocolVersion = "2024-11-05"
 
+// supportedProtocols are the MCP revisions this server can speak. The tool
+// surface (initialize/list/call) is stable across them, so echoing the client's
+// revision avoids a needless downgrade negotiation.
+var supportedProtocols = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+}
+
+func negotiateProtocol(client string) string {
+	if supportedProtocols[client] {
+		return client
+	}
+	return protocolVersion
+}
+
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	var req rpcRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeRPC(w, http.StatusBadRequest, rpcError{-32700, "parse error"}.response(nil))
 		return
 	}
+	reqID := requestIDFrom(r)
 
 	switch req.Method {
 	case "initialize":
 		writeRPC(w, http.StatusOK, map[string]any{
 			"jsonrpc": "2.0", "id": idOrNull(req.ID),
 			"result": map[string]any{
-				"protocolVersion": protocolVersion,
+				"protocolVersion": negotiateProtocol(req.Params.ProtocolVersion),
 				"capabilities":    map[string]any{"tools": map[string]any{}},
-				"serverInfo":      map[string]any{"name": "diagflow-cluster-mcp", "version": "0.2.0"},
+				"serverInfo":      map[string]any{"name": "diagflow-cluster-mcp", "version": "0.3.0"},
 			},
 		})
 	case "notifications/initialized", "ping":
@@ -117,20 +170,45 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		})
 	case "tools/call":
 		agent := agentFrom(r)
+		if !s.limiter.allow(agent) {
+			s.rejected.Inc("rate_limited")
+			w.Header().Set("Retry-After", "1")
+			s.log.Warn("mcp rate limited", "agent", agent, "tool", req.Params.Name,
+				"request_id", reqID)
+			writeRPC(w, http.StatusTooManyRequests, map[string]any{
+				"jsonrpc": "2.0", "id": idOrNull(req.ID),
+				"error": rpcError{Code: -32005, Message: "rate limit exceeded for agent " + agent},
+			})
+			return
+		}
+		var meta struct {
+			ClusterID string `json:"cluster_id"`
+		}
+		if len(req.Params.Arguments) > 0 {
+			_ = json.Unmarshal(req.Params.Arguments, &meta)
+		}
 		start := time.Now()
-		result, rpcErr := s.callTool(r.Context(), req.Params.Name, req.Params.Arguments)
+		result, rpcErr := s.callTool(r.Context(), agent, req.Params.Name, req.Params.Arguments)
 		durationMS := time.Since(start).Milliseconds()
+		s.callDur.Observe(float64(durationMS))
 		if rpcErr != nil {
-			s.callTotal.Inc(agent, req.Params.Name, "error")
+			status := "error"
+			if rpcErr.Code == -32003 {
+				status = "forbidden"
+				s.rejected.Inc("acl")
+			}
+			s.callTotal.Inc(agent, req.Params.Name, status)
 			s.log.Warn("mcp tool call failed", "agent", agent, "tool", req.Params.Name,
+				"cluster_id", meta.ClusterID, "request_id", reqID,
 				"duration_ms", durationMS, "error", rpcErr.Message)
-			writeRPC(w, http.StatusOK, rpcError{Code: -32602, Message: rpcErr.Message}.response(req.ID))
+			writeRPC(w, http.StatusOK, rpcError{Code: rpcErr.Code, Message: rpcErr.Message}.response(req.ID))
 			return
 		}
 		s.callTotal.Inc(agent, req.Params.Name, "ok")
 		// Audit: who fetched what, from which cluster/nodes.
 		s.log.Info("mcp tool call",
-			"agent", agent, "tool", req.Params.Name,
+			"agent", agent, "tool", req.Params.Name, "cluster_id", meta.ClusterID,
+			"request_id", reqID,
 			"args", truncStr(string(req.Params.Arguments), 300),
 			"result_bytes", len(result), "duration_ms", durationMS)
 		writeRPC(w, http.StatusOK, map[string]any{
@@ -162,7 +240,7 @@ type callArgs struct {
 	Dir         string `json:"dir"`
 }
 
-func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, *rpcError) {
+func (s *Server) callTool(ctx context.Context, agent, name string, rawArgs json.RawMessage) (string, *rpcError) {
 	var args callArgs
 	if len(rawArgs) > 0 {
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
@@ -171,6 +249,10 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 	}
 	if args.ClusterID == "" {
 		return "", &rpcError{Code: -32602, Message: "cluster_id is required"}
+	}
+	if !s.acl.allowed(agent, args.ClusterID) {
+		return "", &rpcError{Code: -32003, Message: fmt.Sprintf(
+			"agent %q is not allowed to query cluster %q", agent, args.ClusterID)}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -369,6 +451,10 @@ func (s *Server) searchLogs(ctx context.Context, args callArgs) (string, *rpcErr
 		return "", &rpcError{Code: -32603, Message: "search_logs: no matching nodes"}
 	}
 	candidates = dedupeNodes(candidates)
+	totalNodes := len(candidates)
+	if s.maxSearchNodes > 0 && len(candidates) > s.maxSearchNodes {
+		candidates = candidates[:s.maxSearchNodes]
+	}
 
 	maxLines := clampLines(args.MaxLines)
 	type hit struct {
@@ -394,6 +480,10 @@ func (s *Server) searchLogs(ctx context.Context, args callArgs) (string, *rpcErr
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "# search_logs %q in %s across %d node(s)\n", args.Keywords, args.LogPath, len(candidates))
+	if totalNodes > len(candidates) {
+		fmt.Fprintf(&b, "# sampled %d of %d nodes to stay inside the call budget; pass 'nodes' to target the rest\n",
+			len(candidates), totalNodes)
+	}
 	matched, failed, filtered, omitted := 0, 0, 0, 0
 	for _, r := range results {
 		if r.err != nil {
@@ -557,12 +647,9 @@ func (s *Server) queryYarn(ctx context.Context, args callArgs) (string, *rpcErro
 
 // sshExec runs one whitelisted, read-only command on a node.
 func (s *Server) sshExec(ctx context.Context, args callArgs) (string, *rpcError) {
-	cmd := args.Command
-	if strings.TrimSpace(cmd) == "" {
-		cmd = args.Action
-	}
-	if strings.TrimSpace(cmd) == "" {
-		return "", &rpcError{Code: -32602, Message: "command is required"}
+	cmd := strings.TrimSpace(args.Command)
+	if cmd == "" {
+		return "", &rpcError{Code: -32602, Message: "command is required for ssh_exec"}
 	}
 	node, rpcErr := s.resolveNodeForOps(ctx, args.ClusterID, args.NodeRef, "ssh_exec")
 	if rpcErr != nil || node == nil {
@@ -684,8 +771,10 @@ func filterByState(nodes []infra.NodeInfo, state int) []infra.NodeInfo {
 }
 
 func dedupeNodes(nodes []infra.NodeInfo) []infra.NodeInfo {
-	seen := map[string]bool{}
-	out := nodes[:0]
+	seen := make(map[string]bool, len(nodes))
+	// Copy: callers pass the cached ClusterInfo.NodeInfo slice, and compacting
+	// it in place corrupted the 30s cluster cache and raced between requests.
+	out := make([]infra.NodeInfo, 0, len(nodes))
 	for _, n := range nodes {
 		if seen[n.NodeID] {
 			continue
@@ -733,12 +822,17 @@ func clip(s string, n int) string {
 
 // ---- HTTP plumbing ----
 
-// Handler returns the routed handler (healthz + mcp).
+// Handler returns the routed handler (healthz/readyz/metrics + mcp).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(metrics.Render()))
 	})
 	mux.HandleFunc("POST /mcp", s.auth(s.handleMCP))
 	// /mcp speaks JSON-RPC over POST only. Browsers (and curious humans) open
@@ -758,7 +852,83 @@ func (s *Server) Handler() http.Handler {
 			"    -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n\n" +
 			"Health: GET /healthz\n"))
 	})
-	return mux
+	return withRequestID(mux)
+}
+
+// readyChecker is implemented by data sources that can report whether their
+// upstream (ZooKeeper + the zone's access API) is reachable. Without it,
+// readiness falls back to "the process started", which is not useful.
+type readyChecker interface {
+	Ready(ctx context.Context) error
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	info := map[string]any{"status": "ready", "agents": len(s.tokens)}
+	if s.acl != nil {
+		// Count only: probe endpoints are unauthenticated, and the ACL
+		// itself names agents and clusters.
+		info["acl_agents"] = len(s.acl)
+	}
+	if rc, ok := s.ds.(readyChecker); ok {
+		// ZooKeeper's Children() blocks until it has a session, which can take
+		// longer than the probe's timeout. Race the check so a dead ensemble
+		// yields a prompt 503 instead of stalling the probe.
+		done := make(chan error, 1)
+		go func() { done <- rc.Ready(ctx) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				info["status"] = "not ready"
+				info["reason"] = err.Error()
+				writeJSONStatus(w, http.StatusServiceUnavailable, info)
+				return
+			}
+		case <-ctx.Done():
+			info["status"] = "not ready"
+			info["reason"] = "readiness probe timed out: " + ctx.Err().Error()
+			writeJSONStatus(w, http.StatusServiceUnavailable, info)
+			return
+		}
+	}
+	writeJSONStatus(w, http.StatusOK, info)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// withRequestID stamps every request with an id that is echoed in the response
+// header and every audit line, so a tool call can be correlated with the
+// diagnosis that triggered it.
+func withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+	})
+}
+
+type requestIDKey struct{}
+
+func requestIDFrom(r *http.Request) string {
+	id, _ := r.Context().Value(requestIDKey{}).(string)
+	return id
+}
+
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("req-%d", time.Now().UnixNano())
 }
 
 // ListenAndServe runs until ctx is cancelled, then drains.

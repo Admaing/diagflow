@@ -111,3 +111,73 @@ func TestFromEnvZoneAndRegion(t *testing.T) {
 		t.Fatalf("zone endpoints not parsed: %v", c.Infra.ZoneEndpoints)
 	}
 }
+
+// MCP policy defaults must be protective out of the box: a diagnosis makes a
+// burst of tool calls, and a fan-out must not be able to eat the whole budget.
+func TestMCPPolicyDefaults(t *testing.T) {
+	c := Default()
+	if c.MCP.RateLimit != 20 || c.MCP.RateBurst != 40 {
+		t.Fatalf("rate defaults = %v/%d", c.MCP.RateLimit, c.MCP.RateBurst)
+	}
+	if c.MCP.MaxSearchNodes != 32 {
+		t.Fatalf("max search nodes = %d", c.MCP.MaxSearchNodes)
+	}
+	if c.MCP.ACL != "" {
+		t.Fatalf("ACL default = %q, want empty (unrestricted)", c.MCP.ACL)
+	}
+}
+
+// Log snippets can contain cluster topology and customer identifiers. A
+// third-party documentation lookup must be an explicit operator decision, not
+// a default-on data egress path.
+func TestDeepWikiDisabledByDefault(t *testing.T) {
+	c := Default()
+	if c.DeepWiki.MCPURL != "" {
+		t.Fatalf("DeepWiki default = %q, want disabled", c.DeepWiki.MCPURL)
+	}
+}
+
+func TestDeepWikiCanBeEnabledExplicitly(t *testing.T) {
+	t.Setenv("DIAGFLOW_DEEPWIKI_MCP_URL", "https://mcp.deepwiki.com/mcp")
+	Reset()
+	defer Reset()
+	c := FromEnv()
+	if c.DeepWiki.MCPURL != "https://mcp.deepwiki.com/mcp" {
+		t.Fatalf("DeepWiki env override = %q", c.DeepWiki.MCPURL)
+	}
+}
+
+func TestFromEnvMCPPolicy(t *testing.T) {
+	t.Setenv("DIAGFLOW_MCP_ACL", "diagflow=uhadoop-a,uhadoop-b;opsbot=*")
+	t.Setenv("DIAGFLOW_MCP_RATE_LIMIT", "5")
+	t.Setenv("DIAGFLOW_MCP_RATE_BURST", "7")
+	t.Setenv("DIAGFLOW_MCP_MAX_SEARCH_NODES", "12")
+
+	Reset()
+	defer Reset()
+	c := FromEnv()
+	if c.MCP.ACL != "diagflow=uhadoop-a,uhadoop-b;opsbot=*" {
+		t.Fatalf("ACL = %q", c.MCP.ACL)
+	}
+	if c.MCP.RateLimit != 5 || c.MCP.RateBurst != 7 || c.MCP.MaxSearchNodes != 12 {
+		t.Fatalf("policy = %v/%d/%d", c.MCP.RateLimit, c.MCP.RateBurst, c.MCP.MaxSearchNodes)
+	}
+}
+
+// The nested form is the documented convention for every other section.
+func TestFromEnvMCPPolicyNested(t *testing.T) {
+	t.Setenv("DIAGFLOW_MCP__RATE_LIMIT", "3")
+	t.Setenv("DIAGFLOW_MCP__RATE_BURST", "4")
+	t.Setenv("DIAGFLOW_MCP__MAX_SEARCH_NODES", "9")
+	t.Setenv("DIAGFLOW_MCP__ACL", "a=c1")
+
+	Reset()
+	defer Reset()
+	c := FromEnv()
+	if c.MCP.RateLimit != 3 || c.MCP.RateBurst != 4 || c.MCP.MaxSearchNodes != 9 {
+		t.Fatalf("nested policy = %v/%d/%d", c.MCP.RateLimit, c.MCP.RateBurst, c.MCP.MaxSearchNodes)
+	}
+	if c.MCP.ACL != "a=c1" {
+		t.Fatalf("nested ACL = %q", c.MCP.ACL)
+	}
+}

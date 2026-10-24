@@ -12,6 +12,7 @@ type fakeKB struct {
 	realEmbeddings bool
 	intents        map[string]string // intent → root cause
 	added          []string
+	fingerprintHit map[string]any
 }
 
 func (f *fakeKB) Search(query string, n int) []vectorstore.SearchResult {
@@ -30,7 +31,7 @@ func (f *fakeKB) Search(query string, n int) []vectorstore.SearchResult {
 }
 
 func (f *fakeKB) FingerprintMatch(component, errorPattern, version string) map[string]any {
-	return nil
+	return f.fingerprintHit
 }
 
 func (f *fakeKB) AddCase(component, errorPattern, version, rootCause string, suggestions []string) string {
@@ -145,7 +146,10 @@ func TestSynthesizeFromTraceShortCircuitsOnHistorical(t *testing.T) {
 	s.MatchedHistorical = true
 	s.HistoricalRootCause = "heap 太小"
 
-	rootCause, _, confidence := a.synthesizeFromTrace(t.Context(), trace, map[string]any{}, "flink", "job_failure")
+	rootCause, _, confidence, err := a.synthesizeFromTrace(t.Context(), trace, map[string]any{}, "flink", "job_failure")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if rootCause != "heap 太小" {
 		t.Fatalf("expected historical root cause, got %q", rootCause)
 	}

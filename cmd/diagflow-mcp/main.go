@@ -69,10 +69,31 @@ func main() {
 	log.Info("mcp server configured",
 		"zone", zoneID, "zk", strings.Join(zkHosts, ","), "service", infra.ServiceUHadoopAccess)
 
+	// Optional per-agent cluster allowlist. Malformed input is fatal: silently
+	// ignoring it would run unrestricted while the operator believes otherwise.
+	acl, err := mcpserver.ParseACL(cfg.MCP.ACL)
+	if err != nil {
+		log.Error("invalid DIAGFLOW_MCP_ACL", "error", err)
+		os.Exit(1)
+	}
+	if acl != nil && len(tokens) == 0 {
+		log.Warn("DIAGFLOW_MCP_ACL is set but authentication is disabled; " +
+			"every request will be rejected because it carries no agent identity")
+	}
+
+	log.Info("mcp policy",
+		"agents", len(tokens), "acl", acl.String(),
+		"rate_limit_rps", cfg.MCP.RateLimit, "rate_burst", cfg.MCP.RateBurst,
+		"max_search_nodes", cfg.MCP.MaxSearchNodes)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv := mcpserver.New(log, source, tokens)
+	srv := mcpserver.New(log, source, tokens,
+		mcpserver.WithACL(acl),
+		mcpserver.WithRateLimit(cfg.MCP.RateLimit, cfg.MCP.RateBurst),
+		mcpserver.WithMaxSearchNodes(cfg.MCP.MaxSearchNodes),
+	)
 	if err := srv.ListenAndServe(ctx, *port); err != nil && err != context.Canceled {
 		fmt.Fprintf(os.Stderr, "mcp server error: %v\n", err)
 		os.Exit(1)

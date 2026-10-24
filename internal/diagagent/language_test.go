@@ -49,7 +49,7 @@ func TestSynthesizeCarriesOutputLanguage(t *testing.T) {
 		return m, nil
 	}
 
-	a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
+	_, _, _, _ = a.synthesize(context.Background(), &memory.EvidencePool{}, map[string]any{}, "hdfs", "warn", "")
 
 	if !strings.Contains(prompt, "简体中文") {
 		t.Fatalf("synthesis prompt missing language directive: %q", prompt)

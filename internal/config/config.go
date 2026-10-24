@@ -83,9 +83,25 @@ type ServerConfig struct {
 
 // MCPConfig points DiagFlow at the node-log MCP server. Empty BaseURL =
 // direct infra calls (legacy mode).
+//
+// The remaining fields configure the MCP server itself (cmd/diagflow-mcp):
+// they are read by that process and ignored by the API server.
 type MCPConfig struct {
 	BaseURL string
 	Token   string
+
+	// ACL restricts which clusters each agent may query. Format:
+	// "agent1=uhadoop-a,uhadoop-b;agent2=*". Empty means every authenticated
+	// agent may query every cluster the zone's access API knows about.
+	ACL string
+	// RateLimit is the per-agent allowance for tools/call, in requests per
+	// second. RateBurst is the token-bucket depth. RateLimit <= 0 disables it.
+	RateLimit float64
+	RateBurst int
+	// MaxSearchNodes caps how many nodes a single search_logs call fans out
+	// to, so one call cannot spend the whole request budget on a large
+	// cluster. Remaining nodes are reported as sampled.
+	MaxSearchNodes int
 }
 
 // DeepWikiConfig points DiagFlow at DeepWiki's own MCP server, which serves
@@ -229,9 +245,17 @@ func Default() *Config {
 		ZoneEndpoints: map[string]string{},
 	}
 
-	// DeepWiki is a public, auth-free MCP server; default it on so
-	// deepwiki_query works out of the box (set the env var to override).
-	c.DeepWiki = DeepWikiConfig{MCPURL: "https://mcp.deepwiki.com/mcp"}
+	// DeepWiki sends snippets of cluster logs and problem descriptions to a
+	// public third-party service. Keep it opt-in: an operator must explicitly
+	// accept that trust boundary with DIAGFLOW_DEEPWIKI_MCP_URL.
+	c.DeepWiki = DeepWikiConfig{MCPURL: ""}
+
+	// MCP server defaults: a generous per-agent rate (a single diagnosis makes
+	// ~20 tool calls over minutes) and a node cap that keeps a fan-out inside
+	// the 90s tool budget on clusters of up to a few hundred nodes.
+	c.MCP.RateLimit = 20
+	c.MCP.RateBurst = 40
+	c.MCP.MaxSearchNodes = 32
 
 	return c
 }
@@ -366,6 +390,16 @@ func FromEnv() *Config {
 	setStr(&c.AuthToken, "DIAGFLOW_AUTH_TOKEN")
 	setStr(&c.MCP.BaseURL, "DIAGFLOW_MCP_BASE_URL")
 	setStr(&c.MCP.Token, "DIAGFLOW_MCP_TOKEN")
+	setStr(&c.MCP.ACL, "DIAGFLOW_MCP_ACL")
+	if v := os.Getenv("DIAGFLOW_MCP_RATE_LIMIT"); v != "" {
+		c.MCP.RateLimit = atof(v, c.MCP.RateLimit)
+	}
+	if v := os.Getenv("DIAGFLOW_MCP_RATE_BURST"); v != "" {
+		c.MCP.RateBurst = atoi(v, c.MCP.RateBurst)
+	}
+	if v := os.Getenv("DIAGFLOW_MCP_MAX_SEARCH_NODES"); v != "" {
+		c.MCP.MaxSearchNodes = atoi(v, c.MCP.MaxSearchNodes)
+	}
 	setStr(&c.DeepWiki.MCPURL, "DIAGFLOW_DEEPWIKI_MCP_URL")
 	// Availability zone / region: a zone-level deployment is pinned to one zone.
 	setStr(&c.Region, "DIAGFLOW_REGION")
@@ -491,6 +525,21 @@ func applyNested(c *Config, section, field, value string) {
 			c.Infra.ZoneEndpoints = parseZoneEndpoints(value)
 		case "timeout_s":
 			c.Infra.TimeoutS = atoi(value, c.Infra.TimeoutS)
+		}
+	case "MCP":
+		switch field {
+		case "base_url":
+			c.MCP.BaseURL = value
+		case "token":
+			c.MCP.Token = value
+		case "acl":
+			c.MCP.ACL = value
+		case "rate_limit":
+			c.MCP.RateLimit = atof(value, c.MCP.RateLimit)
+		case "rate_burst":
+			c.MCP.RateBurst = atoi(value, c.MCP.RateBurst)
+		case "max_search_nodes":
+			c.MCP.MaxSearchNodes = atoi(value, c.MCP.MaxSearchNodes)
 		}
 	case "DEEPWIKI":
 		if field == "mcp_url" {

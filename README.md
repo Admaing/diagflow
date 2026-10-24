@@ -19,24 +19,24 @@ when deterministic logic cannot already answer the question.
                     ┌─────────────────────────────┐
                     │   DiagAgent.diagnose()      │
                     │                             │
-                    │  Phase 1  KB semantic search │ ← 0 LLM
+                    │  Phase 1  KB fingerprint     │ ← 0 LLM
+                    │           (semantic if wired)│
                     │  Phase 2  YAML strategy exec │ ← 0 LLM (parallel by priority)
-                    │  Phase 2.5 (removed)         │
-                    │  (semantic fast-path only)   │
                     │  Phase 3  SDK ReAct          │ ← LLM (tool_use loop)
-                    │  Phase 4  Synthesize + verify│ ← LLM (4-layer validator)
-                    │  Phase 5  Auto-index to KB   │ ← 0 LLM (high-confidence only)
+                    │  Phase 4  Synthesize + verify│ ← LLM (deterministic checks + retry)
+                    │  Phase 5  Auto-index to KB   │ ← 0 LLM (ok + high-confidence only)
                     └──────────────┬──────────────┘
                                    ▼
                      DiagnosisReport → Markdown
 ```
 
-- **Phase 1–2.5** cover the deterministic fast paths — semantic search, YAML-driven
-  evidence collection, and exact fingerprint matching.
+- **Phase 1–2** cover the deterministic fast paths — exact fingerprint matching,
+  optional semantic search, and YAML-driven evidence collection.
 - **Phase 3** hands the remaining unknown to the LLM via the Anthropic SDK's native
   tool loop (translated to DeepSeek by the modelverse proxy).
-- **Phase 4** synthesizes a structured conclusion and validates it through four
-  hallucination-control layers.
+- **Phase 4** synthesizes a structured conclusion and validates it through the
+  deterministic layers plus one feedback retry. A failed LLM call is never
+  converted into a root cause: the API returns a dependency error instead.
 
 ## Features
 
@@ -50,15 +50,14 @@ when deterministic logic cannot already answer the question.
 - **Evidence pool**: findings are deposited in a thread-safe `EvidencePool` and shared
   across phases; specialist steps never talk to each other directly.
 
-### 5 Tools (`tools/v3tools.py`)
+### Tools (`internal/tools/v3tools`)
 
-| Tool | Purpose |
-|------|---------|
-| `query_yarn` | Query YARN RM for apps / node placement |
-| `ssh_exec` | Read-only shell commands (allowlist + blacklist guarded) |
-| `call_umr_agent` | HMAC-SHA1 signed umrAgent calls (GetLogs / CheckProcess / GetBaseInfo / GetAppList) |
-| `deepwiki_query` | Verify error classes against upstream component repos via MCP |
-| `fingerprint_match` | MD5 exact-match against known historical cases |
+| Tool group | Tools |
+|------------|-------|
+| Cluster/log evidence | `query_node_log`, `list_logs`, `search_logs`, `query_metrics`, `query_yarn` |
+| Cluster metadata | `get_cluster_info`, `list_nodes` (via the node-log MCP gateway when configured) |
+| Node commands | `ssh_exec` (read-only allowlist), `call_umr_agent` |
+| Knowledge | `fingerprint_match`, `deepwiki_query` |
 
 ### Hybrid RAG (ChromaDB + BM25)
 
@@ -67,15 +66,23 @@ when deterministic logic cannot already answer the question.
 - **BM25**: Keyword-level exact match for error codes and stack traces
 - **RRF Fusion**: Reciprocal Rank Fusion to merge both result sets
 - Falls back to a Milvus Lite backend via `DIAGFLOW_VECTOR_STORE__BACKEND=milvus`.
+- **Current limitation**: the embedding provider is still a stub
+  (`HasRealEmbeddings()` is false), so only exact fingerprints work today. The
+  KB is shared across requests in one process, but is not durable across restarts.
 
-### Four-Layer Illusion Control
+### Validation and failure semantics
 
 | Layer | Method | LLM? |
 |-------|--------|------|
 | 1 | Format validation (root cause length, non-empty suggestions/evidence) | ❌ |
 | 2 | Cross-source consistency (root cause references evidence keywords) | ❌ |
-| 3 | Independent LLM review (structured `validate_diagnosis` tool call) | ✅ |
-| 4 | Retry with feedback (max 2) | ✅ |
+| 3 | Retry synthesis once with validation feedback | ✅ |
+
+An independent LLM review layer is **not implemented yet**. A report with
+`Status: degraded` means part of the pipeline failed but the conclusion came
+from valid evidence; a dependency failure returns `502 llm_unavailable`, and an
+unvalidated model response returns `422 no_conclusion`. Such responses contain
+no `report` object, so operators cannot mistake them for a diagnosis.
 
 ### Pre-built Fault Scenarios
 
@@ -129,25 +136,38 @@ Endpoints:
 | Method | Path                | Description |
 |--------|---------------------|-------------|
 | GET    | `/healthz`          | Liveness |
-| GET    | `/readyz`           | Readiness |
+| GET    | `/readyz`           | Readiness: dependency matrix (`llm`, `cluster_discovery`, `mcp`, `persistence`, `api_auth`) |
 | GET    | `/metrics`          | Prometheus metrics |
 | POST   | `/api/v1/diagnose`  | Run a diagnosis |
-| POST   | `/api/v1/investigate` | Intent-driven investigation |
+| POST   | `/api/v1/investigate` | Intent-driven investigation (forces `investigate=true`) |
 
 ```bash
 curl -s localhost:8080/api/v1/diagnose \
-  -d '{"component":"flink","problem":"Job FAILED","scenario":"flink_oom"}' | jq .
+  -H 'Authorization: Bearer <DIAGFLOW_AUTH_TOKEN>' \
+  -d '{"component":"flink","problem":"Job FAILED","cluster_id":"uhadoop-...","job_id":"application_..."}' | jq .
 ```
 
-> **Degraded mode note**: semantic KB embeddings are not yet wired; the KB
-> fast-path stays disabled and only deterministic/fingerprint paths run.
+`/readyz` returns `200` for both `ready` and `degraded`, and `503` only when a
+critical dependency (LLM configuration, ZooKeeper discovery, or a configured
+MCP gateway) is unavailable. Optional MySQL persistence and missing API auth
+are reported as `degraded` instead of hiding behind a green health check.
+
+> **KB limitation**: semantic embeddings are not wired yet. Exact fingerprints
+> work and are shared for the lifetime of the process; vector similarity is
+> disabled until `HasRealEmbeddings()` has a real provider behind it.
 
 ### Node-log MCP Server (shared by multiple agents)
 
 ```bash
 export DIAGFLOW_MCP_TOKENS="diagflow=token1,opsbot=token2"
 export DIAGFLOW_ZK_HOSTS="10.72.136.107:2181,10.72.136.108:2181"
-export DIAGFLOW_ZONE=666003001        # availability-zone id, scopes ZK discovery
+export DIAGFLOW_ZONE=test03-01
+export DIAGFLOW_INFRA__ZK_ZONE_ID=666003001   # ZK set id, scopes discovery
+# optional policy
+export DIAGFLOW_MCP_ACL="diagflow=uhadoop-a,uhadoop-b;opsbot=*"
+export DIAGFLOW_MCP_RATE_LIMIT=20             # per-agent req/s, 0 disables
+export DIAGFLOW_MCP_RATE_BURST=40
+export DIAGFLOW_MCP_MAX_SEARCH_NODES=32
 ./diagflow-mcp -port 8090
 ```
 
@@ -207,45 +227,78 @@ export DIAGFLOW_MCP_TOKEN=token1
 
 Not in this gateway, by design: `deepwiki_query` targets the public
 `mcp.deepwiki.com` MCP server, so it uses its **own** MCP connection (different
-trust/network boundary). It is enabled by default and calls DeepWiki's
-`ask_question` tool:
+trust/network boundary). It is **disabled by default** because log snippets and
+problem descriptions leave the cluster; enable it explicitly:
 
 ```bash
-# default: https://mcp.deepwiki.com/mcp
 export DIAGFLOW_DEEPWIKI_MCP_URL=https://mcp.deepwiki.com/mcp
 ```
 
 Node operations are read-only by construction: there is no path in the MCP
 server that runs a mutating command.
 
+**Endpoints**:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /mcp` | JSON-RPC 2.0: `initialize`, `tools/list`, `tools/call`, `ping` |
+| `GET /healthz` | Liveness (process is up) |
+| `GET /readyz` | Readiness: ZooKeeper resolves `UHADOOPAccessHTTP` **and** its HTTP port accepts a connection |
+| `GET /metrics` | Prometheus text format (`mcp_tool_calls_total`, `mcp_tool_duration_ms`, `mcp_rejected_total`, …) |
+
+Every request carries an `X-Request-ID` (generated or propagated) that is
+echoed in the response header and every audit line, so a tool call can be
+correlated with the diagnosis that triggered it.
+
+**Policy** (all optional, enforced server-side):
+
+- **Auth**: `agent=token` pairs; the token identifies the agent in ACL checks
+  and audit logs.
+- **ACL**: `agent=cluster[,cluster];agent2=*`. When set, an agent may only
+  query listed clusters and unknown agents are refused (`-32003`). Empty means
+  any authenticated agent may query any cluster in the zone.
+- **Rate limit**: per-agent token bucket for `tools/call` (HTTP 429, `-32005`).
+- **Fan-out cap**: `search_logs` samples at most `DIAGFLOW_MCP_MAX_SEARCH_NODES`
+  nodes and says so in the result, instead of spending the 90s call budget on a
+  large cluster.
+- **Protocol negotiation**: `initialize` echoes the client's MCP revision when
+  it is one of `2024-11-05` / `2025-03-26` / `2025-06-18`.
+
+**Deployment** is a single manifest — `deploy/kubernetes/diagflow-mcp.yaml`
+(Deployment + Service + PDB). The token Secret is created out of band:
+
+```bash
+kubectl -n prj-diaflow create secret generic diagflow-mcp-tokens \
+  --from-literal=DIAGFLOW_MCP_TOKENS="diagflow=<token>,opsbot=<token>" \
+  --from-literal=DIAGFLOW_MCP_CLIENT_TOKEN="<token>"   # the API server's own token
+export IMAGE_TAG=v0.6.0
+envsubst < deploy/kubernetes/diagflow-mcp.yaml | kubectl apply -f -
+```
+
 
 ## Project Structure
 
 ```
 diagflow/
-├── demo/run.py              # Entry point: CLI demo with scenario selection
-├── diagflow/
-│   ├── config.py            # Centralized env-driven config
-│   ├── core/                # ★ Single-Agent diagnostic engine
-│   │   ├── diag_agent.py    #   DiagAgent: 5-phase pipeline (798 lines)
-│   │   ├── strategy.py      #   YAML strategy parsing + Step rendering
-│   │   ├── memory.py        #   EvidencePool + SessionMemory
-│   │   └── validator.py     #   4-layer hallucination control
-│   ├── tools/v3tools.py     # 5 tools (query_yarn/ssh_exec/call_umr_agent/...)
-│   ├── rag/                 # RAG system
-│   │   ├── vector_store.py  #   ChromaDB / Milvus Lite factory
-│   │   ├── embedder.py      #   OpenAI embeddings + offline hash fallback
-│   │   ├── retriever.py     #   Hybrid search (semantic + BM25 + RRF)
-│   │   └── knowledge_base.py#   Case lifecycle + fingerprint persistence
-│   ├── infra/__init__.py    # Production adapter (ZK discovery + umrAgent + node API)
-│   ├── conversation/        # CLI/Web conversation manager (multi-turn)
-│   ├── simulated/           # Mock environment for demo
-│   │   └── scenarios/       # 4 pre-built fault scenarios
-│   └── observability/       # MySQL persistence + event tracker + Markdown report
-├── tests/                   # pytest suite
+├── cmd/diagflow/            # CLI + HTTP API entry point
+├── cmd/diagflow-mcp/        # Read-only node-log MCP gateway
+├── internal/
+│   ├── config/              # Env-driven config
+│   ├── diagagent/           # Five-phase diagnostic engine + investigation path
+│   ├── strategy/            # YAML strategy parsing + parameter rendering
+│   ├── memory/              # EvidencePool + session memory
+│   ├── validator/           # Deterministic conclusion checks
+│   ├── tools/v3tools/       # Tool definitions and MCP-backed implementations
+│   ├── rag/                 # Vector store, retriever, fingerprint knowledge base
+│   ├── infra/               # ZK discovery + UHadoop access + read-only SSH
+│   ├── mcpclient/           # Node-log MCP client (Streamable HTTP)
+│   ├── mcpserver/           # Node-log MCP server + auth/ACL/rate limit
+│   ├── server/              # HTTP API, SSE, embedded operator console
+│   └── observability/       # MySQL history + Markdown report rendering
+├── deploy/                  # Dockerfile, Kubernetes manifests, deploy scripts
+├── tests/                   # Legacy Python reference tests
 └── data/
-    ├── cases/               # Seeded historical cases (Markdown)
-    └── strategies/          # Configurable strategy YAML files
+    └── strategies/          # YAML diagnostic strategies
 ```
 
 ## Production Deployment
@@ -277,13 +330,13 @@ Production Mode (DIAGFLOW_MODE=production):
 
 ### Reused Infrastructure Patterns
 
-The production adapter faithfully ports existing uhadoop-task patterns to Python:
+The production adapter carries over existing uhadoop-task patterns in Go:
 
-| uhadoop-task (Node.js) | DiagFlow (Python) | Notes |
-|----------------------|------------------|-------|
-| `libs/name_container.js` | `UCloudServiceDiscovery` | ZK-based service discovery |
-| `util/agent.js` | `UmrAgentClient` | HMAC-SHA1 signing replicated exactly |
-| `controllor/describe_cluster_nodes.js` | `NodeInfoClient` | Node metadata via uhadoop-manage HTTP API |
+| uhadoop-task (Node.js) | DiagFlow (Go) | Notes |
+|----------------------|----------------|-------|
+| `libs/name_container.js` | `infra.ZoneClusterAccess` | ZK-based service discovery |
+| `util/agent.js` | `infra.RealCluster` / MCP node tools | Read-only node operations |
+| `controllor/describe_cluster_nodes.js` | `infra.AccessClient` | Node metadata via uhadoop-access HTTP API |
 
 ### Deploy to Kubernetes
 
@@ -296,7 +349,8 @@ kubectl apply -f deploy/kubernetes/diagflow-statefulset.yaml
 
 # Set secrets
 kubectl create secret generic diagflow-secrets \
-  --from-literal=DEEPSEEK_API_KEY=sk-... -n uhadoop
+  --from-literal=DEEPSEEK_API_KEY=sk-... \
+  --from-literal=DIAGFLOW_AUTH_TOKEN='<long-random-token>' -n prj-diaflow
 ```
 
 Required environment variables (see `deploy/kubernetes/`):
@@ -310,6 +364,7 @@ Required environment variables (see `deploy/kubernetes/`):
 | `DIAGFLOW_INFRA__ZONE_ENDPOINTS` | `zone1=http://...,zone2=http://...` — per-zone uhadoop-manage endpoints |
 | `UHADOOP_MANAGE_HTTP_BASE` | Global uhadoop-manage endpoint (only used by `direct` discovery mode) |
 | `DEEPSEEK_API_KEY` | LLM API key (via modelverse proxy) |
+| `DIAGFLOW_AUTH_TOKEN` | Bearer token required by the HTTP API; keep it in a Kubernetes Secret |
 | `DIAGFLOW_LLM__LANGUAGE` | Language for LLM-generated report fields (root cause, suggestions, judgments). Defaults to `zh-CN`; set `en` for English |
 
 ### Zone-level deployment

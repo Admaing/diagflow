@@ -46,6 +46,9 @@ type Server struct {
 	access     *infra.ClusterAccess
 	accessErr  error
 
+	kbOnce sync.Once
+	kb     *knowledgebase.KnowledgeBase
+
 	// diagnose runs one diagnosis. It is a field rather than a direct call so
 	// the streaming transport can be exercised without a live model; every
 	// production path uses runDiagnosis.
@@ -77,6 +80,7 @@ type DiagnoseRequest struct {
 	Component   string         `json:"component"`
 	Problem     string         `json:"problem"`
 	Detail      string         `json:"detail,omitempty"`
+	JobID       string         `json:"job_id,omitempty"`
 	Scenario    string         `json:"scenario,omitempty"`
 	ClusterID   string         `json:"cluster_id,omitempty"`
 	SessionID   string         `json:"session_id,omitempty"`
@@ -94,7 +98,7 @@ func (s *Server) Handler() http.Handler {
 		_, _ = w.Write([]byte(metrics.Render()))
 	})
 	mux.Handle("POST /api/v1/diagnose", s.authMiddleware(http.HandlerFunc(s.handleDiagnose)))
-	mux.Handle("POST /api/v1/investigate", s.authMiddleware(http.HandlerFunc(s.handleDiagnose)))
+	mux.Handle("POST /api/v1/investigate", s.authMiddleware(http.HandlerFunc(s.handleInvestigate)))
 	// Same run, narrated as it happens. The plain endpoint stays for callers
 	// that only want the final report (scripts, the MCP-facing path).
 	mux.Handle("POST /api/v1/diagnose/stream", s.authMiddleware(http.HandlerFunc(s.handleDiagnoseStream)))
@@ -156,27 +160,99 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readyz reports whether the process can serve diagnoses (dependency probe:
-// config is loadable and, in production, cluster discovery is configured).
+// readyz reports whether the process can serve diagnoses. Kubernetes only
+// understands 200/503, so the body carries a dependency matrix: "degraded"
+// still serves traffic but names the optional dependency that is unavailable.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
+	checks := map[string]any{}
+	criticalFailures := []string{}
+	warnings := []string{}
+	degraded := false
+
+	add := func(name, status, detail string, critical bool) {
+		checks[name] = map[string]any{"status": status, "detail": detail}
+		switch status {
+		case "unavailable":
+			if critical {
+				criticalFailures = append(criticalFailures, name+": "+detail)
+			} else {
+				degraded = true
+				warnings = append(warnings, name+": "+detail)
+			}
+		case "degraded":
+			degraded = true
+			warnings = append(warnings, name+": "+detail)
+		}
+	}
+
+	if strings.TrimSpace(cfg.LLM.APIKey) != "" {
+		add("llm", "ok", "API key configured", true)
+	} else if cfg.IsProduction() {
+		add("llm", "unavailable", "DEEPSEEK_API_KEY/LLM_API_KEY is not configured", true)
+	} else {
+		add("llm", "degraded", "no LLM API key; diagnoses cannot complete", false)
+	}
+
+	if !cfg.IsProduction() || len(cfg.Infra.ZKHosts) > 0 {
+		add("cluster_discovery", "ok", "ZooKeeper discovery configured", cfg.IsProduction())
+	} else {
+		add("cluster_discovery", "unavailable", "DIAGFLOW_ZK_HOSTS is required in production", true)
+	}
+
+	if cfg.MCP.BaseURL == "" {
+		add("mcp", "disabled", "direct infrastructure mode", false)
+	} else {
+		probeCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		err := s.mcpClient().Health(probeCtx)
+		cancel()
+		if err != nil {
+			add("mcp", "unavailable", err.Error(), true)
+		} else {
+			add("mcp", "ok", "health endpoint reachable", true)
+		}
+	}
+
+	if s.dbStore.Enabled() {
+		add("persistence", "ok", "MySQL connected", false)
+	} else {
+		add("persistence", "degraded", "history persistence disabled or MySQL unreachable", false)
+	}
+
+	if strings.TrimSpace(cfg.AuthToken) != "" {
+		add("api_auth", "ok", "bearer authentication enabled", false)
+	} else if cfg.IsProduction() {
+		add("api_auth", "degraded", "DIAGFLOW_AUTH_TOKEN is not configured", false)
+	} else {
+		add("api_auth", "disabled", "demo mode without bearer authentication", false)
+	}
+
+	status := "ready"
+	code := http.StatusOK
+	if len(criticalFailures) > 0 {
+		status = "not ready"
+		code = http.StatusServiceUnavailable
+	} else if degraded {
+		status = "degraded"
+	}
 	info := map[string]any{
-		"status": "ready",
+		"status": status,
 		"mode":   modeLabel(cfg),
 		"region": cfg.Region,
 		"zone":   cfg.Zone,
+		"checks": checks,
+	}
+	if len(criticalFailures) > 0 {
+		info["reason"] = strings.Join(criticalFailures, "; ")
+	}
+	if len(warnings) > 0 {
+		info["warnings"] = warnings
 	}
 	if cfg.IsProduction() {
-		if len(cfg.Infra.ZKHosts) == 0 {
-			info["status"] = "not ready"
-			info["reason"] = "DIAGFLOW_ZK_HOSTS is required in production"
-			writeJSON(w, http.StatusServiceUnavailable, info)
-			return
-		}
 		info["zk_hosts"] = cfg.Infra.ZKHosts
 		info["zk_zone"] = cfg.ZKZone()
 	}
-	writeJSON(w, http.StatusOK, info)
+	writeJSON(w, code, info)
 }
 
 func modeLabel(cfg *config.Config) string {
@@ -187,6 +263,14 @@ func modeLabel(cfg *config.Config) string {
 }
 
 func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
+	s.handleDiagnosis(w, r, false)
+}
+
+func (s *Server) handleInvestigate(w http.ResponseWriter, r *http.Request) {
+	s.handleDiagnosis(w, r, true)
+}
+
+func (s *Server) handleDiagnosis(w http.ResponseWriter, r *http.Request, forceInvestigate bool) {
 	var req DiagnoseRequest
 	r.Body = http.MaxBytesReader(w, r.Body, int64(s.cfg.MaxBodyBytes))
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -200,6 +284,9 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 			"component and problem are required"))
 		return
 	}
+	if forceInvestigate {
+		req.Investigate = true
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(),
 		time.Duration(s.cfg.RequestTimeoutS)*time.Second)
@@ -208,14 +295,10 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rpt, markdown, err := s.diagnose(ctx, &req, nil)
 	durationMS := float64(time.Since(start).Milliseconds())
-	diagTotal.Inc(req.Component, statusFor(err))
+	diagTotal.Inc(req.Component, diagnosisStatus(err, rpt))
 	if err != nil {
 		s.log.Error("diagnosis failed", "component", req.Component, "problem", req.Problem, "error", err)
-		if strings.Contains(err.Error(), "unknown scenario") {
-			writeJSON(w, http.StatusBadRequest, errJSON("unknown_scenario", err.Error()))
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errJSON("diagnosis_failed", truncateErr(err)))
+		writeDiagnosisError(w, err)
 		return
 	}
 	diagDuration.Observe(durationMS)
@@ -226,6 +309,25 @@ func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 		"report":   rpt,
 		"markdown": markdown,
 	})
+}
+
+func writeDiagnosisError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		writeJSON(w, http.StatusGatewayTimeout, errJSON("diagnosis_timeout", "诊断超时，未生成结论"))
+	case errors.Is(err, diagagent.ErrLLMUnavailable):
+		writeJSON(w, http.StatusBadGateway, errJSON("llm_unavailable",
+			"模型调用失败，未生成诊断结论: "+truncateErr(err)))
+	case errors.Is(err, diagagent.ErrNoConclusion):
+		writeJSON(w, http.StatusUnprocessableEntity, errJSON("no_conclusion",
+			"证据不足或模型输出无效，未生成可验证结论: "+truncateErr(err)))
+	case strings.Contains(err.Error(), "unknown scenario"):
+		writeJSON(w, http.StatusBadRequest, errJSON("unknown_scenario", err.Error()))
+	case strings.Contains(err.Error(), "cluster_id is required"):
+		writeJSON(w, http.StatusBadRequest, errJSON("cluster_id_required", err.Error()))
+	default:
+		writeJSON(w, http.StatusInternalServerError, errJSON("diagnosis_failed", truncateErr(err)))
+	}
 }
 
 // recordDiagnosis persists a completed run to the session cache (hot) and to
@@ -247,7 +349,8 @@ func (s *Server) recordDiagnosis(req *DiagnoseRequest, rpt *diagagent.Report) {
 
 	s.log.Info("diagnosis done",
 		"component", req.Component, "problem", req.Problem,
-		"confidence", rpt.Confidence, "duration_ms", rpt.DurationMS,
+		"status", rpt.Status, "confidence", rpt.Confidence, "duration_ms", rpt.DurationMS,
+		"warnings", len(rpt.Warnings),
 		"phases", strings.Join(rpt.PhasesRun, ","))
 }
 
@@ -262,8 +365,7 @@ func (s *Server) runDiagnosis(ctx context.Context, req *DiagnoseRequest, onEvent
 	// Per-request agent + toolset: the cluster-bound tools and the agent's
 	// per-diagnose state (eventID, llmCalls) are request-local, so concurrent
 	// requests never share mutable state.
-	vstore := vectorstore.NewMemory()
-	kb := knowledgebase.New(vstore)
+	kb := s.knowledgeBase()
 	defs := v3tools.BuildV3Tools(c, kb, s.mcpClient(), s.deepwikiClient())
 
 	if onEvent == nil {
@@ -275,10 +377,7 @@ func (s *Server) runDiagnosis(ctx context.Context, req *DiagnoseRequest, onEvent
 	)
 	agent.RegisterTools(defs)
 
-	contextData := req.Context
-	if contextData == nil {
-		contextData = map[string]any{}
-	}
+	contextData := diagnosisContext(req)
 	for k, v := range c.Context() {
 		if _, ok := contextData[k]; !ok {
 			contextData[k] = v
@@ -299,6 +398,41 @@ func (s *Server) runDiagnosis(ctx context.Context, req *DiagnoseRequest, onEvent
 		return nil, "", err
 	}
 	return rpt, report.Render(rpt), nil
+}
+
+// diagnosisContext copies the caller's context and fills the fields the YAML
+// strategies rely on. Copying avoids mutating a map owned by the request while
+// still making job_id available to {{ context.job_id }} templates.
+func diagnosisContext(req *DiagnoseRequest) map[string]any {
+	contextData := make(map[string]any, len(req.Context)+4)
+	for k, v := range req.Context {
+		contextData[k] = v
+	}
+	if _, ok := contextData["component"]; !ok {
+		contextData["component"] = req.Component
+	}
+	if _, ok := contextData["problem"]; !ok {
+		contextData["problem"] = req.Problem
+	}
+	if req.Detail != "" {
+		if _, ok := contextData["detail"]; !ok {
+			contextData["detail"] = req.Detail
+		}
+	}
+	if req.JobID != "" {
+		contextData["job_id"] = req.JobID
+	}
+	return contextData
+}
+
+// knowledgeBase is process-scoped so fingerprints learned from one diagnosis
+// are available to the next request. The vector store is still in-memory; this
+// removes the per-request reset without pretending the KB is durable.
+func (s *Server) knowledgeBase() *knowledgebase.KnowledgeBase {
+	s.kbOnce.Do(func() {
+		s.kb = knowledgebase.New(vectorstore.NewMemory())
+	})
+	return s.kb
 }
 
 // resolveCluster builds the cluster adapter for a request. In demo mode this is
@@ -460,6 +594,33 @@ func statusFor(err error) string {
 		return "error"
 	}
 	return "ok"
+}
+
+func diagnosisStatus(err error, rpt *diagagent.Report) string {
+	if err != nil {
+		return "error"
+	}
+	if rpt != nil && rpt.Status == diagagent.ReportStatusDegraded {
+		return "degraded"
+	}
+	return "ok"
+}
+
+func diagnosisErrorCode(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "diagnosis_timeout"
+	case errors.Is(err, diagagent.ErrLLMUnavailable):
+		return "llm_unavailable"
+	case errors.Is(err, diagagent.ErrNoConclusion):
+		return "no_conclusion"
+	case strings.Contains(err.Error(), "unknown scenario"):
+		return "unknown_scenario"
+	case strings.Contains(err.Error(), "cluster_id is required"):
+		return "cluster_id_required"
+	default:
+		return "diagnosis_failed"
+	}
 }
 
 // ---- helpers ----

@@ -36,6 +36,13 @@ type KnowledgeBase interface {
 
 // Report is the structured diagnosis result (mirrors DiagnosisReport).
 type Report struct {
+	// Status is "ok" when a reliable conclusion was produced and "degraded"
+	// when part of the pipeline failed but the conclusion still rests on
+	// valid evidence. Failures that leave no trustworthy conclusion are
+	// returned as errors instead of a Report.
+	Status           string
+	Error            string
+	Warnings         []string
 	EventID          string
 	Component        string
 	ProblemType      string
@@ -50,6 +57,23 @@ type Report struct {
 	PhasesRun        []string
 	Trace            *InvestigationTrace
 }
+
+const (
+	// ReportStatusOK means every dependency needed for the conclusion worked.
+	ReportStatusOK = "ok"
+	// ReportStatusDegraded means a non-critical phase failed, but the final
+	// conclusion was still produced from valid evidence.
+	ReportStatusDegraded = "degraded"
+)
+
+var (
+	// ErrLLMUnavailable identifies a model/gateway failure. Callers must not
+	// turn this into a diagnosis; the HTTP layer maps it to 502.
+	ErrLLMUnavailable = errors.New("llm dependency unavailable")
+	// ErrNoConclusion means the model responded, but its output could not be
+	// validated into a trustworthy diagnosis.
+	ErrNoConclusion = errors.New("no reliable diagnosis conclusion")
+)
 
 // EventFunc is the streaming trace callback (mirrors on_event).
 type EventFunc func(msg string)
@@ -168,6 +192,7 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 	a.llmCalls = 0
 	a.stepOrder = 0
 	start := time.Now()
+	warnings := []string{}
 
 	a.emit(fmt.Sprintf("[%s] starting %s/%s", a.eventID, component, problemType))
 
@@ -178,22 +203,52 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 	phases := []string{}
 
 	// ---- Phase 1: KB fast-path ----
-	if a.kb != nil && a.kb.HasRealEmbeddings() {
-		if hit := a.kbMatch(contextData); hit != nil {
-			a.emit(fmt.Sprintf("[%s] KB hit — skipping LLM", a.eventID))
-			report := &Report{
+	// Fingerprints do not need an embedding model, so an exact repeat of a
+	// known error can short-circuit even when semantic search is unavailable.
+	if hit := a.fingerprintHit(component, contextData); hit != nil {
+		rootCause := strOr(hit["root_cause"], "")
+		suggestions := toStrSlice(hit["suggestions"])
+		if rootCause != "" && len(suggestions) > 0 {
+			a.emit(fmt.Sprintf("[%s] KB fingerprint hit — skipping LLM", a.eventID))
+			return &Report{
+				Status:           ReportStatusOK,
 				EventID:          a.eventID,
 				Component:        component,
 				ProblemType:      problemType,
-				RootCause:        strOr(hit["root_cause"], "已知问题"),
+				RootCause:        rootCause,
 				Confidence:       "high",
-				EvidenceSummary:  []map[string]any{},
-				Suggestions:      toStrSlice(hit["suggestions"]),
+				EvidenceSummary:  []map[string]any{{"source_agent": "knowledge_base", "category": "fingerprint_match", "summary": "命中历史指纹", "detail": rootCause, "confidence": 1.0}},
+				Suggestions:      suggestions,
 				MatchedKnowledge: true,
 				DurationMS:       float64(time.Since(start).Milliseconds()),
 				PhasesRun:        []string{"kb_fast_path"},
+			}, nil
+		}
+		a.emit(fmt.Sprintf("[%s] fingerprint hit ignored: incomplete case data", a.eventID))
+	}
+	if a.kb != nil && a.kb.HasRealEmbeddings() {
+		if hit := a.kbMatch(contextData); hit != nil {
+			a.emit(fmt.Sprintf("[%s] KB hit — skipping LLM", a.eventID))
+			rootCause := strOr(hit["root_cause"], "")
+			suggestions := toStrSlice(hit["suggestions"])
+			if rootCause == "" || len(suggestions) == 0 {
+				a.emit(fmt.Sprintf("[%s] KB hit ignored: incomplete root cause or suggestions", a.eventID))
+			} else {
+				report := &Report{
+					Status:           ReportStatusOK,
+					EventID:          a.eventID,
+					Component:        component,
+					ProblemType:      problemType,
+					RootCause:        rootCause,
+					Confidence:       "high",
+					EvidenceSummary:  []map[string]any{},
+					Suggestions:      suggestions,
+					MatchedKnowledge: true,
+					DurationMS:       float64(time.Since(start).Milliseconds()),
+					PhasesRun:        []string{"kb_fast_path"},
+				}
+				return report, nil
 			}
-			return report, nil
 		}
 	}
 
@@ -210,38 +265,51 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 	a.emit(fmt.Sprintf("[%s] Phase 3: SDK ReAct", a.eventID))
 	phases = append(phases, "react")
 	taskPrompt := strat.BuildTaskPrompt(stringMap(contextData))
-	agentOutput := a.runReact(ctx, taskPrompt, pool, contextData, 12)
-	pool.Add(memory.NewEvidence("react", "agent_analysis", trunc(agentOutput, 300), agentOutput, 0.7))
+	agentOutput, reactErr := a.runReact(ctx, taskPrompt, pool, contextData, 12)
+	if reactErr != nil {
+		warning := "ReAct 阶段失败：" + reactErr.Error()
+		warnings = append(warnings, warning)
+		a.emit(fmt.Sprintf("[%s] %s", a.eventID, warning))
+	} else if meaningfulConclusion(agentOutput) {
+		pool.Add(memory.NewEvidence("react", "agent_analysis", trunc(agentOutput, 300), agentOutput, 0.7))
+	}
 
 	// ---- Phase 4: synthesize + validate ----
 	a.emit(fmt.Sprintf("[%s] Phase 4: synthesis + validation", a.eventID))
 	phases = append(phases, "validate")
-	rootCause, suggestions, confidence := a.synthesize(ctx, pool, contextData, component, problemType, "")
+	rootCause, suggestions, confidence, synthErr := a.synthesize(ctx, pool, contextData, component, problemType, "")
 	if ok, feedback := a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
 		a.emit(fmt.Sprintf("[%s] validation failed (%s) — retrying", a.eventID, feedback))
-		rootCause, suggestions, confidence = a.synthesize(ctx, pool, contextData, component, problemType, feedback)
-	}
-	// Synthesis is a best-effort LLM call. If it came back empty (call error,
-	// unsupported request shape, truncated output), fall back to the ReAct
-	// conclusion rather than emitting a report with no root cause at all.
-	if strings.TrimSpace(rootCause) == "" && strings.TrimSpace(agentOutput) != "" {
-		a.emit(fmt.Sprintf("[%s] synthesis empty — falling back to ReAct conclusion", a.eventID))
-		rootCause = trunc(agentOutput, 400)
-		if ok, _ := a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
-			suggestions = []string{"请复核上述已收集的证据后重新诊断。"}
+		rootCause, suggestions, confidence, synthErr = a.synthesize(ctx, pool, contextData, component, problemType, feedback)
+		if ok, feedback = a.validator.ValidateLayer(rootCause, suggestions, pool.Len()); !ok {
+			if synthErr == nil {
+				synthErr = fmt.Errorf("%w: conclusion failed validation: %s", ErrNoConclusion, feedback)
+			}
 		}
+	}
+	if synthErr != nil {
+		return nil, synthErr
+	}
+	if !meaningfulConclusion(rootCause) {
+		return nil, fmt.Errorf("%w: synthesis returned an empty root cause", ErrNoConclusion)
+	}
+	status := ReportStatusOK
+	if len(warnings) > 0 {
+		status = ReportStatusDegraded
 	}
 
 	durationMS := float64(time.Since(start).Milliseconds())
 	a.emit(fmt.Sprintf("[%s] done in %.0fms", a.eventID, durationMS))
 
 	// ---- Phase 5: auto-index (high-confidence only) ----
-	if a.kb != nil && confidence == "high" {
+	if a.kb != nil && confidence == "high" && status == ReportStatusOK {
 		phases = append(phases, "kb_index")
 		a.kbIndex(rootCause, suggestions, pool, contextData)
 	}
 
 	report := &Report{
+		Status:           status,
+		Warnings:         warnings,
 		EventID:          a.eventID,
 		Component:        component,
 		ProblemType:      problemType,
@@ -256,6 +324,45 @@ func (a *Agent) Diagnose(ctx context.Context, component, problemType string, con
 		PhasesRun:        phases,
 	}
 	return report, nil
+}
+
+// fingerprintHit checks the deterministic KB fast-path. It deliberately does
+// not require semantic embeddings: an exact component/error/version match is
+// useful even when the embedding provider is disabled.
+func (a *Agent) fingerprintHit(component string, contextData map[string]any) map[string]any {
+	if a.kb == nil {
+		return nil
+	}
+	pattern := errorPatternFromContext(contextData, a.errorKeywords)
+	if pattern == "" {
+		return nil
+	}
+	return a.kb.FingerprintMatch(component, pattern, strOr(contextData["version"], ""))
+}
+
+func errorPatternFromContext(contextData map[string]any, keywords []string) string {
+	for _, key := range []string{"error_pattern", "error", "exception"} {
+		if s := strings.TrimSpace(strOr(contextData[key], "")); s != "" {
+			return s
+		}
+	}
+	var text strings.Builder
+	for _, key := range []string{"problem", "problem_desc", "detail", "message"} {
+		text.WriteString(" ")
+		text.WriteString(strOr(contextData[key], ""))
+	}
+	haystack := text.String()
+	for _, kw := range keywords {
+		if strings.Contains(haystack, kw) {
+			return kw
+		}
+	}
+	return ""
+}
+
+func meaningfulConclusion(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && s != "no conclusion" && s != "证据不足，无法给出诊断结论。" && s != "无法得出结论"
 }
 
 // kbMatch mirrors _kb_match (Phase 1 semantic search).
@@ -314,20 +421,23 @@ func metadataSuggestions(v any) []string {
 func (a *Agent) kbIndex(rootCause string, suggestions []string, pool *memory.EvidencePool, contextData map[string]any) {
 	component := strOr(contextData["component"], "unknown")
 	version := strOr(contextData["version"], "")
-	errorPattern := trunc(rootCause, 80)
-	for _, ev := range pool.All() {
-		for _, kw := range a.errorKeywords {
-			if strings.Contains(ev.Detail, kw) {
+	errorPattern := errorPatternFromContext(contextData, a.errorKeywords)
+	if errorPattern == "" {
+		for _, ev := range pool.All() {
+			if kw := a.firstErrorKeyword(ev.Detail); kw != "" {
 				errorPattern = kw
 				break
 			}
 		}
 	}
+	if errorPattern == "" {
+		errorPattern = trunc(rootCause, 80)
+	}
 	a.kb.AddCase(component, errorPattern, version, rootCause, suggestions)
 }
 
 // runReact mirrors _run_react (SDK ReAct loop with maxTurns + 3-turn stall).
-func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.EvidencePool, contextData map[string]any, maxTurns int) string {
+func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.EvidencePool, contextData map[string]any, maxTurns int) (string, error) {
 	system := a.buildSystemPrompt(evidence, contextData)
 
 	messages := []anthropic.MessageParam{
@@ -354,8 +464,7 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 
 		resp, err := a.callLLM(ctx, params)
 		if err != nil {
-			// Degrade gracefully on LLM failure.
-			return fmt.Sprintf("[agent] LLM error: %v", err)
+			return "", fmt.Errorf("%w: %w", ErrLLMUnavailable, err)
 		}
 
 		var toolUses []anthropic.ContentBlockUnion
@@ -371,9 +480,9 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 
 		if len(toolUses) == 0 {
 			if len(textParts) > 0 {
-				return strings.Join(textParts, "\n")
+				return strings.Join(textParts, "\n"), nil
 			}
-			return "no conclusion"
+			return "", nil
 		}
 
 		// Append assistant turn with tool_use blocks.
@@ -470,7 +579,7 @@ func (a *Agent) runReact(ctx context.Context, task string, evidence *memory.Evid
 
 // finalize makes one last tool-free LLM call so the run always ends in a
 // diagnosis rather than an empty report.
-func (a *Agent) finalize(ctx context.Context, system string, messages []anthropic.MessageParam, nudge string) string {
+func (a *Agent) finalize(ctx context.Context, system string, messages []anthropic.MessageParam, nudge string) (string, error) {
 	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(nudge)))
 	final, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
@@ -481,13 +590,13 @@ func (a *Agent) finalize(ctx context.Context, system string, messages []anthropi
 	})
 	if err != nil {
 		a.emit(fmt.Sprintf("[agent] finalize LLM call failed: %v", err))
-		return "证据不足，无法给出诊断结论。"
+		return "", fmt.Errorf("%w: %w", ErrLLMUnavailable, err)
 	}
-	return firstText(final)
+	return firstText(final), nil
 }
 
 // synthesize mirrors _synthesize (structured output via tool_use).
-func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, contextData map[string]any, component, problemType, feedback string) (string, []string, string) {
+func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, contextData map[string]any, component, problemType, feedback string) (string, []string, string, error) {
 	prompt := fmt.Sprintf(
 		"You are a diagnostic synthesiser. Review the evidence and produce a structured diagnosis.\n\n"+
 			"Component: %s — Problem: %s\n\n"+
@@ -518,35 +627,49 @@ func (a *Agent) synthesize(ctx context.Context, pool *memory.EvidencePool, conte
 		ToolChoice:  anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}},
 	})
 	if err != nil {
-		// Swallowing this turned a hard API rejection into an empty report
-		// with a meaningless fallback root cause. Surface it instead.
 		a.emit(fmt.Sprintf("[agent] synthesis LLM call failed: %v", err))
-	} else {
-		for _, b := range resp.Content {
-			if b.Type == "tool_use" && b.Name == "report_diagnosis" {
-				var args struct {
-					RootCause   string   `json:"root_cause"`
-					Confidence  string   `json:"confidence"`
-					Suggestions []string `json:"suggestions"`
-				}
-				if json.Unmarshal(b.Input, &args) == nil && args.RootCause != "" && len(args.Suggestions) > 0 {
-					return args.RootCause, args.Suggestions, args.Confidence
-				}
-				// An empty input means the model ran out of output budget
-				// mid-thought; say so instead of looking like "no findings".
-				a.emit(fmt.Sprintf("[agent] synthesis returned an unusable report_diagnosis input (%d bytes, stop_reason=%s)",
-					len(b.Input), resp.StopReason))
+		return "", nil, "", fmt.Errorf("%w: %w", ErrLLMUnavailable, err)
+	}
+	for _, b := range resp.Content {
+		if b.Type == "tool_use" && b.Name == "report_diagnosis" {
+			var args struct {
+				RootCause   string   `json:"root_cause"`
+				Confidence  string   `json:"confidence"`
+				Suggestions []string `json:"suggestions"`
 			}
+			if json.Unmarshal(b.Input, &args) == nil && meaningfulConclusion(args.RootCause) && len(args.Suggestions) > 0 {
+				return args.RootCause, args.Suggestions, normalizeConfidence(args.Confidence), nil
+			}
+			// An empty input means the model ran out of output budget
+			// mid-thought; say so instead of looking like "no findings".
+			a.emit(fmt.Sprintf("[agent] synthesis returned an unusable report_diagnosis input (%d bytes, stop_reason=%s)",
+				len(b.Input), resp.StopReason))
+			return "", nil, "", fmt.Errorf("%w: report_diagnosis input was empty or incomplete", ErrNoConclusion)
 		}
 	}
 
-	// Fallback: text parsing.
+	// Fallback: only accept an explicit, parseable text conclusion. Arbitrary
+	// prose (an error message, a refusal, a truncated answer) is not a root
+	// cause and must never be rendered as one.
 	text := firstText(resp)
-	return parseTextFallback(text)
+	rootCause, suggestions, confidence := parseTextFallback(text)
+	if !meaningfulConclusion(rootCause) {
+		return "", nil, "", fmt.Errorf("%w: synthesis returned no structured conclusion", ErrNoConclusion)
+	}
+	return rootCause, suggestions, confidence, nil
+}
+
+func normalizeConfidence(confidence string) string {
+	switch strings.ToLower(strings.TrimSpace(confidence)) {
+	case "high", "medium", "low":
+		return strings.ToLower(strings.TrimSpace(confidence))
+	default:
+		return "low"
+	}
 }
 
 func parseTextFallback(text string) (string, []string, string) {
-	rootCause, confidence, suggestions := "", "medium", []string{}
+	rootCause, confidence, suggestions := "", "", []string{}
 	for _, line := range strings.Split(text, "\n") {
 		s := strings.TrimSpace(line)
 		up := strings.ToUpper(s)
@@ -559,13 +682,10 @@ func parseTextFallback(text string) (string, []string, string) {
 			suggestions = append(suggestions, strings.TrimPrefix(s, "- "))
 		}
 	}
-	if rootCause == "" {
-		rootCause = trunc(text, 300)
-	}
 	if len(suggestions) == 0 {
 		suggestions = []string{"请复核已收集的证据后重新诊断"}
 	}
-	return rootCause, suggestions, confidence
+	return rootCause, suggestions, normalizeConfidence(confidence)
 }
 
 func (a *Agent) runStrategy(ctx context.Context, strat strategy.Strategy, contextData map[string]any, pool *memory.EvidencePool) {
@@ -608,7 +728,23 @@ func (a *Agent) runStrategy(ctx context.Context, strat strategy.Strategy, contex
 }
 
 func (a *Agent) executeStep(ctx context.Context, step strategy.Step, contextData map[string]any, pool *memory.EvidencePool) {
-	if step.Action == "fingerprint_match" || step.Action == "llm_decide" {
+	if step.Action == "fingerprint_match" {
+		component := strOr(contextData["component"], "")
+		hit := a.fingerprintHit(component, contextData)
+		if hit == nil {
+			a.emit(fmt.Sprintf("[strategy] fingerprint_match: no known case for %s", component))
+			return
+		}
+		rootCause := strOr(hit["root_cause"], "")
+		if rootCause == "" {
+			return
+		}
+		pool.Add(memory.NewEvidence("strategy", "fingerprint_match",
+			"命中历史指纹: "+trunc(rootCause, 160), rootCause, 0.95))
+		a.emit(fmt.Sprintf("[strategy] fingerprint_match hit: %s", trunc(rootCause, 120)))
+		return
+	}
+	if step.Action == "llm_decide" {
 		return
 	}
 	if step.Action != "tool_call" {

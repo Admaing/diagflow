@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"log/slog"
 
 	"github.com/Admaing/diagflow/internal/config"
+	"github.com/Admaing/diagflow/internal/diagagent"
 )
 
 func newTestServer() *Server {
@@ -62,8 +65,9 @@ func TestDiagnoseValidation(t *testing.T) {
 	}
 }
 
-func TestDiagnoseHappyPathNoLLM(t *testing.T) {
+func TestDiagnoseHappyPath(t *testing.T) {
 	srv := newTestServer()
+	srv.diagnose = stubDiagnose(t, nil, nil)
 	rec := httptest.NewRecorder()
 	body := `{"component":"flink","problem":"Job FAILED","scenario":"flink_oom"}`
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/diagnose", strings.NewReader(body)))
@@ -82,6 +86,57 @@ func TestDiagnoseHappyPathNoLLM(t *testing.T) {
 	}
 	if rec.Header().Get("X-Request-ID") == "" {
 		t.Fatal("missing X-Request-ID header")
+	}
+}
+
+func TestDiagnoseMapsDependencyFailureToBadGateway(t *testing.T) {
+	srv := newTestServer()
+	srv.diagnose = func(context.Context, *DiagnoseRequest, func(string)) (*diagagent.Report, string, error) {
+		return nil, "", fmt.Errorf("%w: upstream 403 Forbidden", diagagent.ErrLLMUnavailable)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/diagnose",
+		strings.NewReader(`{"component":"flink","problem":"Job FAILED"}`)))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("got %d want 502, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "llm_unavailable") {
+		t.Fatalf("expected llm_unavailable code, body=%s", rec.Body.String())
+	}
+}
+
+func TestInvestigateRouteEnablesInvestigation(t *testing.T) {
+	srv := newTestServer()
+	called := false
+	srv.diagnose = func(_ context.Context, req *DiagnoseRequest, _ func(string)) (*diagagent.Report, string, error) {
+		called = true
+		if !req.Investigate {
+			t.Fatal("/investigate must force Investigate=true")
+		}
+		return &diagagent.Report{Status: diagagent.ReportStatusOK, EventID: "diag-test", Component: req.Component}, "## ok", nil
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/investigate",
+		strings.NewReader(`{"component":"flink","problem":"Job FAILED","investigate":false}`)))
+	if rec.Code != http.StatusOK || !called {
+		t.Fatalf("got status=%d called=%v body=%s", rec.Code, called, rec.Body.String())
+	}
+}
+
+func TestDiagnosisContextInjectsJobAndPreservesCallerData(t *testing.T) {
+	req := &DiagnoseRequest{
+		Component: "flink", Problem: "Job FAILED", Detail: "container exit 137", JobID: "application_42",
+		Context: map[string]any{"version": "1.17.2", "component": "explicit-component"},
+	}
+	got := diagnosisContext(req)
+	if got["job_id"] != "application_42" || got["version"] != "1.17.2" || got["detail"] != "container exit 137" {
+		t.Fatalf("context not enriched: %v", got)
+	}
+	if got["component"] != "explicit-component" {
+		t.Fatalf("caller context was overwritten: %v", got["component"])
+	}
+	if _, exists := req.Context["job_id"]; exists {
+		t.Fatal("the caller's context map must not be mutated")
 	}
 }
 
@@ -116,6 +171,7 @@ func productionServer(t *testing.T) *Server {
 	t.Setenv("DIAGFLOW_REGION", "test03")
 	t.Setenv("DIAGFLOW_ZONE", "test03-01")
 	t.Setenv("DIAGFLOW_ZK_HOSTS", "zk-a:2181,zk-b:2181")
+	t.Setenv("DEEPSEEK_API_KEY", "test-key")
 	t.Cleanup(config.Reset)
 	return New(slog.New(slog.NewJSONHandler(&strings.Builder{}, nil)), nil)
 }
@@ -142,6 +198,51 @@ func TestReadyzReportsZoneInProduction(t *testing.T) {
 	}
 }
 
+func TestReadyzFailsWithoutLLMKeyInProduction(t *testing.T) {
+	config.Reset()
+	t.Setenv("DIAGFLOW_MODE", "production")
+	t.Setenv("DIAGFLOW_REGION", "test03")
+	t.Setenv("DIAGFLOW_ZONE", "test03-01")
+	t.Setenv("DIAGFLOW_ZK_HOSTS", "zk-a:2181")
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("DIAGFLOW_LLM__API_KEY", "")
+	t.Cleanup(config.Reset)
+	srv := New(slog.New(slog.NewJSONHandler(&strings.Builder{}, nil)), nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d want 503, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	checks, _ := body["checks"].(map[string]any)
+	llm, _ := checks["llm"].(map[string]any)
+	if llm["status"] != "unavailable" {
+		t.Fatalf("llm check = %v, want unavailable", llm)
+	}
+}
+
+func TestReadyzFailsWhenConfiguredMCPIsUnreachable(t *testing.T) {
+	config.Reset()
+	t.Setenv("DIAGFLOW_MODE", "production")
+	t.Setenv("DIAGFLOW_REGION", "test03")
+	t.Setenv("DIAGFLOW_ZONE", "test03-01")
+	t.Setenv("DIAGFLOW_ZK_HOSTS", "zk-a:2181")
+	t.Setenv("DEEPSEEK_API_KEY", "test-key")
+	t.Setenv("DIAGFLOW_MCP_BASE_URL", "http://127.0.0.1:1/mcp")
+	t.Setenv("DIAGFLOW_MCP_TOKEN", "test-token")
+	t.Cleanup(config.Reset)
+	srv := New(slog.New(slog.NewJSONHandler(&strings.Builder{}, nil)), nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d want 503, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // Production without ZooKeeper hosts cannot discover any cluster endpoint, so
 // the instance must report itself not ready.
 func TestReadyzFailsWithoutZooKeeper(t *testing.T) {
@@ -163,8 +264,8 @@ func TestProductionDiagnoseRequiresClusterID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/diagnose",
 		strings.NewReader(`{"component":"flink","problem":"Job FAILED"}`)))
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected failure without cluster_id, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without cluster_id, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "cluster_id") {
 		t.Fatalf("expected cluster_id error, got %s", rec.Body.String())
@@ -184,10 +285,13 @@ func TestWebUIServed(t *testing.T) {
 		t.Fatalf("GET / content-type = %q, want text/html", ct)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"DiagFlow", "/api/v1/diagnose", "id=\"problem\""} {
+	for _, want := range []string{"DiagFlow", "/api/v1/diagnose", "id=\"problem\"", "id=\"jobId\"", "/readyz"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("console HTML missing %q", want)
 		}
+	}
+	if strings.Contains(body, "uhadoop-1v9waqiylmqj") {
+		t.Fatal("console must not hard-code a production cluster id")
 	}
 }
 

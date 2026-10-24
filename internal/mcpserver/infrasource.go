@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -30,6 +31,32 @@ var _ DataSource = (*InfraSource)(nil)
 // ClusterInfo returns cluster metadata.
 func (s *InfraSource) ClusterInfo(ctx context.Context, clusterID string) (*infra.ClusterInfo, error) {
 	return s.Access.DescribeCluster(ctx, clusterID)
+}
+
+// Ready verifies the gateway's upstream is reachable: ZooKeeper resolves the
+// zone's UHADOOPAccessHTTP instance and that instance's HTTP port accepts a
+// connection. A process that started but can reach neither is not ready to
+// serve tool calls.
+//
+// The check deliberately stops at the TCP layer. Probing a specific action
+// (ping_http) would make readiness depend on the deployed access-plane
+// version: an older binary without that action would keep every MCP pod
+// NotReady and take the whole gateway out of service.
+func (s *InfraSource) Ready(ctx context.Context) error {
+	if s.Access == nil || s.Access.Resolver == nil {
+		return fmt.Errorf("no cluster access configured (set DIAGFLOW_ZK_HOSTS)")
+	}
+	ep, err := s.Access.Resolver.Pick(ctx)
+	if err != nil {
+		return fmt.Errorf("discover UHADOOPAccessHTTP: %w", err)
+	}
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", ep.Addr())
+	if err != nil {
+		return fmt.Errorf("access API %s unreachable: %w", ep.Addr(), err)
+	}
+	_ = conn.Close()
+	return nil
 }
 
 // Nodes returns the cluster's nodes.

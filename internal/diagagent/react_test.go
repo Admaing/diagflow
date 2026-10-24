@@ -3,6 +3,7 @@ package diagagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -73,7 +74,10 @@ func TestRunReactFinalizesWhenTurnBudgetExhausted(t *testing.T) {
 		return textMessage("ROOT CAUSE: disk full"), nil
 	}
 
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 3)
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out != "ROOT CAUSE: disk full" {
 		t.Fatalf("expected a forced conclusion, got %q", out)
 	}
@@ -101,7 +105,10 @@ func TestRunReactFinalizesOnStall(t *testing.T) {
 		return textMessage("conclusion from stall"), nil
 	}
 
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 10)
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out != "conclusion from stall" {
 		t.Fatalf("expected a stall conclusion, got %q", out)
 	}
@@ -113,20 +120,24 @@ func TestRunReactReturnsTextWithoutTools(t *testing.T) {
 	a.callLLMHook = func(context.Context, anthropic.MessageNewParams) (*anthropic.Message, error) {
 		return textMessage("direct answer"), nil
 	}
-	if out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 5); out != "direct answer" {
+	if out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 5); err != nil || out != "direct answer" {
 		t.Fatalf("got %q", out)
 	}
 }
 
-// A failing LLM must degrade gracefully, not panic.
-func TestRunReactDegradesOnLLMError(t *testing.T) {
+// A failing LLM must surface a typed error, not a message that callers can
+// mistake for a diagnosis.
+func TestRunReactReturnsDependencyError(t *testing.T) {
 	a := New(WithModel("test-model"))
 	a.callLLMHook = func(context.Context, anthropic.MessageNewParams) (*anthropic.Message, error) {
 		return nil, context.DeadlineExceeded
 	}
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 5)
-	if out == "" {
-		t.Fatal("expected a degraded message, got empty output")
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 5)
+	if out != "" {
+		t.Fatalf("a failed run must not emit a conclusion, got %q", out)
+	}
+	if !errors.Is(err, ErrLLMUnavailable) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected an ErrLLMUnavailable wrapping the deadline, got %v", err)
 	}
 }
 
@@ -152,7 +163,10 @@ func TestRunReactSkipsIdenticalRepeatedCalls(t *testing.T) {
 		return textMessage("concluded"), nil
 	}
 
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 6)
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 6)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out != "concluded" {
 		t.Fatalf("got %q", out)
 	}
@@ -182,7 +196,10 @@ func TestRunReactStallDetectorIgnoresRepeatedContent(t *testing.T) {
 		return textMessage("stalled conclusion"), nil
 	}
 
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 20)
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out != "stalled conclusion" {
 		t.Fatalf("got %q", out)
 	}
@@ -209,7 +226,10 @@ func TestRunReactStopsAtToolCallBudget(t *testing.T) {
 	}
 
 	// maxTurns is far above the budget so the call budget is what stops it.
-	out := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 100)
+	out, err := a.runReact(context.Background(), "diagnose", &memory.EvidencePool{}, map[string]any{}, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out != "budget conclusion" {
 		t.Fatalf("got %q", out)
 	}

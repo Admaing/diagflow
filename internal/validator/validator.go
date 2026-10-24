@@ -21,6 +21,10 @@ func New() *Validator {
 			"log", "metric", "config", "error", "oom",
 			"timeout", "memory", "disk", "cpu", "checkpoint",
 			"known", "issue", "bug", "deepwiki",
+			// Reports default to zh-CN; an otherwise evidence-backed Chinese
+			// conclusion must not be rejected merely for lacking an English
+			// noun from the list above.
+			"日志", "指标", "配置", "错误", "异常", "内存", "磁盘", "网络", "超时", "已知",
 		},
 	}
 }

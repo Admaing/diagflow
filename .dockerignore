@@ -9,6 +9,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.dsh-runtime/
+conversation-archive/
+ucloud-flink-serverless/
 tests/
 # Dead Python implementation kept on disk but unused by the Go build.
 diagflow/

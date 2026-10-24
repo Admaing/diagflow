@@ -29,6 +29,7 @@ type KnownCase struct {
 // KnowledgeBase manages fingerprints + hybrid retrieval.
 type KnowledgeBase struct {
 	mu           sync.Mutex
+	retrieverMu  sync.Mutex
 	Store        vectorstore.VectorStore
 	Embedder     *embedder.Embedder
 	Retriever    *retriever.HybridRetriever
@@ -165,11 +166,15 @@ func (kb *KnowledgeBase) AddCase(component, errorPattern, version, rootCause str
 
 // Search runs hybrid search across all indexed cases.
 func (kb *KnowledgeBase) Search(query string, n int) []vectorstore.SearchResult {
+	kb.retrieverMu.Lock()
+	defer kb.retrieverMu.Unlock()
 	return kb.Retriever.Search(query, n, 0.6, 0.4)
 }
 
 // RebuildBM25 rebuilds the retriever index from the store.
 func (kb *KnowledgeBase) RebuildBM25() {
+	kb.retrieverMu.Lock()
+	defer kb.retrieverMu.Unlock()
 	kb.Retriever.RebuildFromStore()
 }
 

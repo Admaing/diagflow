@@ -79,7 +79,7 @@ func readyCluster() *infra.ClusterInfo {
 		App:          []infra.ClusterApp{{AppName: "Hive", AppVersion: "3.1.3", AppStatus: 1}},
 		NodeInfo: []infra.NodeInfo{
 			{NodeID: "n1", NodeName: "c-master1", NodeType: "master", NodeIP: "10.0.0.1",
-				AccessUser: "root", Passwd: "c2VjcmV0", NodeState: 1, ServiceName: []string{"NameNode"}},
+				AccessUser: "root", Passwd: "c2VjcmV0", NodeState: 1, ServiceName: infra.FlexStrings{"NameNode"}},
 			{NodeID: "n2", NodeName: "c-master2", NodeType: "master", NodeIP: "10.0.0.2", NodeState: 1},
 			{NodeID: "n3", NodeName: "c-core1", NodeType: "core", NodeIP: "10.0.0.3", NodeState: 1},
 		},

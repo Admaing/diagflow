@@ -70,7 +70,7 @@ func runServer(portOverride int) {
 		cfg.Server.Port = portOverride
 	}
 	if cfg.LLM.APIKey == "" {
-		fmt.Fprintln(os.Stderr, "warning: DEEPSEEK_API_KEY/LLM_API_KEY not set — diagnoses will degrade")
+		fmt.Fprintln(os.Stderr, "warning: DEEPSEEK_API_KEY/LLM_API_KEY not set — diagnosis requests will fail with a dependency error")
 	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{

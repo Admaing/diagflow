@@ -45,25 +45,56 @@ func (f *FlexInt) UnmarshalJSON(b []byte) error {
 
 func (f FlexInt) Int() int { return int(f) }
 
+// FlexStrings accepts the two shapes the UHadoop access API returns for
+// service_name: a single string or an array of strings. The API is not
+// consistent between describe_cluster and list-node responses.
+type FlexStrings []string
+
+func (f *FlexStrings) UnmarshalJSON(b []byte) error {
+	trimmed := bytes.TrimSpace(b)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*f = nil
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var one string
+		if err := json.Unmarshal(trimmed, &one); err != nil {
+			return fmt.Errorf("FlexStrings: %w", err)
+		}
+		if one == "" {
+			*f = nil
+		} else {
+			*f = FlexStrings{one}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(trimmed, &many); err != nil {
+		return fmt.Errorf("FlexStrings: %w", err)
+	}
+	*f = FlexStrings(many)
+	return nil
+}
+
 // NodeInfo mirrors the proto NodeInfo message (read-only subset).
 type NodeInfo struct {
-	NodeType    string   `json:"node_type"` // master | core | task | client
-	NodeID      string   `json:"node_id"`
-	UHostID     string   `json:"uhost_id"`
-	NodeName    string   `json:"node_name"`
-	NodeIP      string   `json:"node_ip"`
-	NodeIPv6    string   `json:"node_ipv6"`
-	AccessUser  string   `json:"access_user"`
-	Passwd      string   `json:"passwd"` // base64; never exposed to callers
-	UHostType   string   `json:"uhost_type"`
-	NodeState   FlexInt  `json:"node_state"`
-	ServiceName []string `json:"service_name"`
-	InstanceID  string   `json:"instance_id"`
-	AgentKey    string   `json:"agent_key"`
-	ZoneID      FlexInt  `json:"zone_id"`
-	UHostName   string   `json:"uhost_name"`
-	Remark      string   `json:"remark"`
-	Scaling     bool     `json:"scaling"`
+	NodeType    string      `json:"node_type"` // master | core | task | client
+	NodeID      string      `json:"node_id"`
+	UHostID     string      `json:"uhost_id"`
+	NodeName    string      `json:"node_name"`
+	NodeIP      string      `json:"node_ip"`
+	NodeIPv6    string      `json:"node_ipv6"`
+	AccessUser  string      `json:"access_user"`
+	Passwd      string      `json:"passwd"` // base64; never exposed to callers
+	UHostType   string      `json:"uhost_type"`
+	NodeState   FlexInt     `json:"node_state"`
+	ServiceName FlexStrings `json:"service_name"`
+	InstanceID  string      `json:"instance_id"`
+	AgentKey    string      `json:"agent_key"`
+	ZoneID      FlexInt     `json:"zone_id"`
+	UHostName   string      `json:"uhost_name"`
+	Remark      string      `json:"remark"`
+	Scaling     bool        `json:"scaling"`
 }
 
 // ClusterApp is one application installed on a cluster.
@@ -104,9 +135,9 @@ type NodeApp struct {
 
 // NodeService is an application instance running on one node.
 type NodeService struct {
-	NodeID      string   `json:"node_id"`
-	NodeIP      string   `json:"node_ip"`
-	ServiceName []string `json:"service_name"`
+	NodeID      string      `json:"node_id"`
+	NodeIP      string      `json:"node_ip"`
+	ServiceName FlexStrings `json:"service_name"`
 }
 
 // Call invokes an action and returns its Data object.

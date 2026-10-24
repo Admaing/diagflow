@@ -34,7 +34,8 @@
   header .spacer { flex: 1; }
   .status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .dot.ok { background: var(--ok); } .dot.err { background: var(--err); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
+  .dot.err { background: var(--err); }
   main { max-width: 1080px; margin: 0 auto; padding: 20px; display: grid; gap: 16px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
   /* Jumping to the result must clear the sticky header, otherwise the meta row
@@ -61,6 +62,9 @@
   }
   .badge.high { color: var(--ok); } .badge.medium { color: var(--warn); }
   .badge.low { color: var(--err); } .badge.unknown { color: var(--muted); }
+  .badge.ok { color: var(--ok); } .badge.degraded { color: var(--warn); }
+  .badge.failed { color: var(--err); }
+  .warnings { color: var(--warn); font-size: 13px; margin: 8px 0 12px; }
   .meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); margin-bottom: 12px; }
   h2 { font-size: 15px; margin: 18px 0 8px; }
   h2:first-child { margin-top: 0; }
@@ -135,8 +139,8 @@
         </datalist>
       </div>
       <div>
-        <label for="cluster">集群 ID *</label>
-        <input id="cluster" type="text" placeholder="uhadoop-xxxxxxxxxxxx" value="uhadoop-1v9waqiylmqj">
+        <label for="cluster">集群 ID（生产环境必填）</label>
+        <input id="cluster" type="text" placeholder="uhadoop-xxxxxxxxxxxx">
       </div>
       <div>
         <label for="token">Bearer Token（服务未启用鉴权时留空）</label>
@@ -151,6 +155,10 @@
       <div>
         <label for="detail">补充信息（可选）</label>
         <input id="detail" type="text" placeholder="报错原文、时间窗口、作业名…">
+      </div>
+      <div>
+        <label for="jobId">作业 / 告警 ID（可选）</label>
+        <input id="jobId" type="text" placeholder="例如 application_...">
       </div>
       <div>
         <label for="investigate">排查模式</label>
@@ -193,9 +201,11 @@
   var LS_HISTORY = "diagflow.history";
   var running = false;
 
-  $("token").value = localStorage.getItem(LS_TOKEN) || "";
+  // Keep the bearer token for this tab only. Persisting it in localStorage
+  // leaves a cluster-API credential behind after the operator closes the tab.
+  $("token").value = sessionStorage.getItem(LS_TOKEN) || "";
   $("token").addEventListener("change", function () {
-    localStorage.setItem(LS_TOKEN, $("token").value.trim());
+    sessionStorage.setItem(LS_TOKEN, $("token").value.trim());
   });
 
   function headers() {
@@ -206,9 +216,15 @@
   }
 
   function checkHealth() {
-    fetch("/healthz").then(function (r) {
-      $("dot").className = "dot " + (r.ok ? "ok" : "err");
-      $("statusText").textContent = r.ok ? "服务正常" : "服务异常 (" + r.status + ")";
+    fetch("/readyz").then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (data) {
+        var state = data.status || (r.ok ? "ready" : "not ready");
+        var cls = state === "ready" ? "ok" : (state === "degraded" ? "warn" : "err");
+        $("dot").className = "dot " + cls;
+        $("statusText").textContent = "服务" + (state === "ready" ? "就绪" : (state === "degraded" ? "降级" : "不可用"));
+        var detail = data.reason || (data.warnings && data.warnings.length ? data.warnings[0] : "");
+        if (detail) { $("statusText").title = detail; }
+      });
     }).catch(function () {
       $("dot").className = "dot err";
       $("statusText").textContent = "无法连接服务";
@@ -233,10 +249,13 @@
     var r = payload.report || {};
     var ev = r.EvidenceSummary || [];
     var html = "";
+    var status = String(r.Status || "ok").toLowerCase();
+    var statusLabel = { ok: "🟢 成功", degraded: "🟡 降级" }[status] || status;
 
     html += '<div class="meta">'
       + '<span>事件 <code>' + esc(r.EventID) + '</code></span>'
       + '<span>组件 <b>' + esc(r.Component) + '</b></span>'
+      + '<span>状态 <span class="badge ' + esc(status) + '">' + esc(statusLabel) + '</span></span>'
       + '<span>置信度 <span class="badge ' + confClass(r.Confidence) + '">' + confLabel(r.Confidence) + '</span></span>'
       + (r.DurationMS ? '<span>耗时 ' + (r.DurationMS / 1000).toFixed(1) + 's</span>' : '')
       + (r.LLMCalls ? '<span>LLM ' + r.LLMCalls + ' 次</span>' : '')
@@ -244,6 +263,12 @@
       + '<span>阶段 ' + esc((r.PhasesRun || []).join(" → ")) + '</span>'
       + (r.MatchedKnowledge ? '<span>✅ 命中知识库</span>' : '')
       + '</div>';
+
+    if (r.Warnings && r.Warnings.length) {
+      html += '<div class="warnings"><b>降级警告</b><ul>';
+      for (var w = 0; w < r.Warnings.length; w++) { html += "<li>" + esc(r.Warnings[w]) + "</li>"; }
+      html += "</ul></div>";
+    }
 
     html += "<h2>根因</h2>";
     html += r.RootCause
@@ -297,7 +322,7 @@
       var li = document.createElement("li");
       li.innerHTML = '<div><b>' + esc(item.report.Component) + "</b> — "
         + esc(String(item.report.ProblemType || "").slice(0, 70))
-        + '<div class="h-sub">' + esc(item.report.Confidence || "") + " · "
+        + '<div class="h-sub">' + esc(item.report.Status || "ok") + " · " + esc(item.report.Confidence || "") + " · "
         + esc(new Date(item.at).toLocaleString()) + "</div></div>";
       li.addEventListener("click", function () {
         $("result").innerHTML = renderReport(item);
@@ -408,6 +433,8 @@
     var body = { component: component, problem: problem, cluster_id: cluster };
     var detail = $("detail").value.trim();
     if (detail) { body.detail = detail; }
+    var jobId = $("jobId").value.trim();
+    if (jobId) { body.job_id = jobId; }
     if ($("investigate").value === "true") { body.investigate = true; }
 
     setRunning(true);

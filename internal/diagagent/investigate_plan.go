@@ -53,8 +53,7 @@ func (a *Agent) buildInvestigationPlan(ctx context.Context, component string, co
 		}),
 	}
 
-	a.llmCalls++
-	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
 		MaxTokens:   512,
 		Temperature: anthropic.Float(0.2),
@@ -189,7 +188,7 @@ func (a *Agent) dispatchDeepwiki(ctx context.Context, component string, step *In
 // tools, collects their outputs as log snippets, then asks for a judgment
 // (whether the intent points at a root cause and whether a component bug is
 // suspected). Returns (judgment, suspectComponentBug).
-func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextData map[string]any) (string, bool) {
+func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextData map[string]any) (string, bool, error) {
 	system := "You are a senior SRE executing a single investigation intent. " +
 		"Use tools to gather the log/metric evidence for this intent. Keep it focused " +
 		"— call at most 4 tools, then stop." + languageDirective(a.language)
@@ -209,7 +208,6 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 	}
 
 	for turn := 0; turn < 4; turn++ {
-		a.llmCalls++
 		params := anthropic.MessageNewParams{
 			Model:       anthropic.Model(a.model),
 			MaxTokens:   1024,
@@ -221,9 +219,9 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 			params.Tools = tp
 		}
 
-		resp, err := a.client.Messages.New(ctx, params)
+		resp, err := a.callLLM(ctx, params)
 		if err != nil {
-			return "排查过程中 LLM 调用失败", false
+			return "", false, fmt.Errorf("%w: %w", ErrLLMUnavailable, err)
 		}
 
 		var toolUses []anthropic.ContentBlockUnion
@@ -239,7 +237,7 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 
 		if len(toolUses) == 0 {
 			judgment := strings.Join(textParts, "\n")
-			return judgment, suspectBug(judgment)
+			return judgment, suspectBug(judgment), nil
 		}
 
 		// Record assistant turn.
@@ -275,8 +273,7 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 	}
 
 	// Final: ask for a judgment if loop exhausted.
-	a.llmCalls++
-	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+	resp, err := a.callLLM(ctx, anthropic.MessageNewParams{
 		Model:       anthropic.Model(a.model),
 		MaxTokens:   512,
 		Temperature: anthropic.Float(0.1),
@@ -284,10 +281,10 @@ func (a *Agent) runIntent(ctx context.Context, step *InvestigationStep, contextD
 		Messages:    messages,
 	})
 	if err != nil {
-		return "无法得出结论", false
+		return "", false, fmt.Errorf("%w: %w", ErrLLMUnavailable, err)
 	}
 	judgment := firstText(resp)
-	return judgment, suspectBug(judgment)
+	return judgment, suspectBug(judgment), nil
 }
 
 // suspectBug heuristically flags whether a judgment suggests a component bug.
@@ -319,11 +316,13 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 	a.emit(fmt.Sprintf("[%s] internal investigation: %s/%s", a.eventID, component, problemType))
 
 	trace := &InvestigationTrace{Component: component, ProblemType: problemType}
+	warnings := []string{}
 
 	intents, err := a.buildInvestigationPlan(ctx, component, contextData)
 	if err != nil {
 		// Fall back to a single default intent if the LLM fails to propose.
 		intents = []intentItem{{Intent: "定位失败的任务并收集其错误日志"}}
+		warnings = append(warnings, "排查计划生成失败："+err.Error())
 		a.emit(fmt.Sprintf("[%s] intent proposal failed, using default — %v", a.eventID, err))
 	}
 
@@ -342,7 +341,12 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 		// 3. Execute the intent.
 		a.emit(fmt.Sprintf("[%s] executing intent: %s", a.eventID, it.Intent))
 		step := trace.AddStep(it.Intent)
-		judgment, suspect := a.runIntent(ctx, step, contextData)
+		judgment, suspect, err := a.runIntent(ctx, step, contextData)
+		if err != nil {
+			warnings = append(warnings, "排查步骤失败："+err.Error())
+			a.emit(fmt.Sprintf("[%s] intent failed: %v", a.eventID, err))
+			continue
+		}
 		step.Judgment = judgment
 		step.SuspectComponentBug = suspect
 		if suspect {
@@ -355,12 +359,21 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 	}
 
 	// 4. Final synthesis.
-	rootCause, suggestions, confidence := a.synthesizeFromTrace(ctx, trace, contextData, component, problemType)
+	rootCause, suggestions, confidence, err := a.synthesizeFromTrace(ctx, trace, contextData, component, problemType)
+	if err != nil {
+		return nil, err
+	}
+	status := ReportStatusOK
+	if len(warnings) > 0 {
+		status = ReportStatusDegraded
+	}
 
 	durationMS := float64(time.Since(start).Milliseconds())
 	a.emit(fmt.Sprintf("[%s] investigation done in %.0fms", a.eventID, durationMS))
 
 	return &Report{
+		Status:           status,
+		Warnings:         warnings,
 		EventID:          a.eventID,
 		Component:        component,
 		ProblemType:      problemType,
@@ -370,6 +383,8 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 		Suggestions:      suggestions,
 		MatchedKnowledge: len(matchedRootCauses) > 0,
 		DurationMS:       durationMS,
+		LLMCalls:         a.llmCalls,
+		LLMTokens:        a.llmTokens,
 		PhasesRun:        []string{"intent_plan", "intent_execute", "synthesize"},
 		Trace:            trace,
 	}, nil
@@ -377,7 +392,7 @@ func (a *Agent) Investigate(ctx context.Context, component, problemType string, 
 
 // synthesizeFromTrace builds the final conclusion from an investigation trace,
 // reusing the existing synthesize() path by constructing an evidence pool.
-func (a *Agent) synthesizeFromTrace(ctx context.Context, trace *InvestigationTrace, contextData map[string]any, component, problemType string) (string, []string, string) {
+func (a *Agent) synthesizeFromTrace(ctx context.Context, trace *InvestigationTrace, contextData map[string]any, component, problemType string) (string, []string, string, error) {
 	// If any intent matched a historical root cause, that already answers the
 	// problem — short-circuit without a further LLM synthesis (matches the
 	// "命中历史即复用结论" intent, and avoids a divergent hallucinated root cause).
@@ -388,12 +403,12 @@ func (a *Agent) synthesizeFromTrace(ctx context.Context, trace *InvestigationTra
 		}
 	}
 	if len(historical) > 0 {
-		return historical[0], []string{"复用历史排查结论"}, "high"
+		return historical[0], []string{"复用历史排查结论"}, "high", nil
 	}
 
 	pool := trace.toEvidencePool()
 	if pool.Len() == 0 {
-		return "未能收集到足够证据", []string{"扩大日志范围后重试"}, "low"
+		return "", nil, "", fmt.Errorf("%w: investigation collected no evidence", ErrNoConclusion)
 	}
 	return a.synthesize(ctx, pool, contextData, component, problemType, "")
 }

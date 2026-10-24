@@ -17,6 +17,11 @@ func Render(r *diagagent.Report) string {
 	fmt.Fprintf(&b, "- **事件 ID**: %s\n", r.EventID)
 	fmt.Fprintf(&b, "- **组件**: %s\n", r.Component)
 	fmt.Fprintf(&b, "- **问题类型**: %s\n", r.ProblemType)
+	status := r.Status
+	if status == "" {
+		status = "ok"
+	}
+	fmt.Fprintf(&b, "- **状态**: %s\n", status)
 	fmt.Fprintf(&b, "- **耗时**: %.0fms\n", r.DurationMS)
 	matched := "❌"
 	if r.MatchedKnowledge {
@@ -24,6 +29,16 @@ func Render(r *diagagent.Report) string {
 	}
 	fmt.Fprintf(&b, "- **匹配知识库**: %s\n", matched)
 	fmt.Fprintf(&b, "- **时间**: %s\n\n", time.Now().Format(time.RFC3339))
+	if r.Error != "" {
+		fmt.Fprintf(&b, "> **诊断错误**: %s\n\n", r.Error)
+	}
+	if len(r.Warnings) > 0 {
+		b.WriteString("> **降级警告**\n")
+		for _, warning := range r.Warnings {
+			fmt.Fprintf(&b, "> - %s\n", warning)
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("---\n\n## 根因分析\n\n")
 	fmt.Fprintf(&b, "**根因**: %s\n\n", r.RootCause)
 	fmt.Fprintf(&b, "**置信度**: %s\n\n", confidenceBadge(r.Confidence))

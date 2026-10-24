@@ -26,6 +26,36 @@ func New(baseURL, token string) *Client {
 	return &Client{BaseURL: baseURL, Token: token, Timeout: 30 * time.Second}
 }
 
+// Health checks the MCP gateway's lightweight health endpoint. Readiness must
+// not invoke a tool (that would query a cluster on every probe); a 2xx from
+// /healthz is enough to prove the configured gateway is reachable.
+func (c *Client) Health(ctx context.Context) error {
+	base := strings.TrimSuffix(c.BaseURL, "/")
+	base = strings.TrimSuffix(base, "/mcp")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	timeout := c.Timeout
+	if timeout <= 0 || timeout > 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	client := c.client
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("mcp health HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // CallTool invokes a tool and returns the concatenated text content.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	callArgs, err := json.Marshal(map[string]any{
