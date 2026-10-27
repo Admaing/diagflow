@@ -1,13 +1,6 @@
-# Python
-.venv/
+# Local scratch output from tools outside the Go build
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 *.log
 
 # Deploy — 含公司内网配置, 不上传

@@ -1,21 +1,12 @@
 # Local/runtime artifacts not needed to build the Go binaries.
-.venv/
 .git/
 .github/
 .claude/
-__pycache__/
-**/__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .dsh-runtime/
 conversation-archive/
 ucloud-flink-serverless/
-tests/
-# Dead Python implementation kept on disk but unused by the Go build.
+# Ignored local scripts (they hold cluster credentials; never shipped).
 diagflow/
-demo/
 # Kubernetes manifests are not part of the image.
 deploy/kubernetes/
 *.tar.gz
