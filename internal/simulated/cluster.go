@@ -1,5 +1,5 @@
-// Package simulated mirrors diagflow/simulated — a mock cluster that serves
-// pre-generated scenario data for demo without real infrastructure.
+// Package simulated provides a mock cluster that serves pre-generated scenario
+// data for the demo without touching real infrastructure.
 package simulated
 
 import (

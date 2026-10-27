@@ -1,7 +1,8 @@
-// Package infra mirrors diagflow/infra/__init__.py — the production
-// infrastructure adapter. It bridges DiagFlow to real UHadoop infrastructure
-// via umrAgent HTTP (HMAC-SHA1 signed, no SSH) and the uhadoop-manage HTTP API
-// (no direct MySQL).
+// Package infra is the production infrastructure adapter. Cluster metadata comes
+// from the zone's UHadoop access HTTP API (discovered through ZooKeeper); node
+// logs, metrics, and configs are read over read-only SSH. There is no direct
+// MySQL access. UmrAgentClient is kept for the umrAgent transport but is not
+// wired into RealCluster yet.
 package infra
 
 import (

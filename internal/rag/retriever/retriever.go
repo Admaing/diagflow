@@ -1,5 +1,6 @@
-// Package retriever mirrors diagflow/rag/retriever.py — hybrid semantic +
-// BM25 search fused with Reciprocal Rank Fusion (RRF).
+// Package retriever implements hybrid semantic + BM25 search fused with
+// Reciprocal Rank Fusion (RRF). The semantic half returns nothing while the
+// embedder is a stub.
 package retriever
 
 import (

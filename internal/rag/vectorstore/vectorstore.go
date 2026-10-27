@@ -1,7 +1,6 @@
-// Package vectorstore mirrors diagflow/rag/vector_store.py — a store abstraction
-// with an in-memory implementation for offline demo/tests. The interface holds
-// the same shape as the Python ChromaDB-backed store so upstream code sees a
-// uniform API regardless of backend.
+// Package vectorstore defines the vector-store abstraction. The only backend
+// implemented today is in-memory (NewMemory), so the KB is process-scoped and
+// is lost on restart. The chromadb/milvus config fields are not wired.
 package vectorstore
 
 import (
@@ -10,7 +9,7 @@ import (
 	"sync"
 )
 
-// SearchResult mirrors the Python retriever's expected dict per hit.
+// SearchResult is one hit returned by a store search.
 type SearchResult struct {
 	ID          string
 	Document    string

@@ -1,4 +1,5 @@
-// Package v3tools implements the five v3 diagnostic tools.
+// Package v3tools builds the diagnostic tool set (11 tools) over a cluster data
+// source, with MCP-backed implementations when a gateway is configured.
 package v3tools
 
 import (

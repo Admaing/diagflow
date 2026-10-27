@@ -1,5 +1,6 @@
-// Package strategy mirrors diagflow/core/strategy.py — YAML-driven diagnostic
-// plans. Steps reference tool_call / fingerprint_match / llm_decide actions.
+// Package strategy parses YAML diagnostic plans and renders their parameters.
+// Steps reference tool_call / fingerprint_match / llm_decide actions; steps in
+// the same priority batch run concurrently.
 package strategy
 
 import (

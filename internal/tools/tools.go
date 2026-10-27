@@ -1,5 +1,5 @@
-// Package tools mirrors diagflow/tools/v3tools.py — the five v3 tool
-// definitions wired as Anthropic SDK tools with async handlers.
+// Package tools defines the tool surface shared by the agent and the v3 tool
+// builders: an Anthropic-compatible definition plus a handler.
 package tools
 
 import (

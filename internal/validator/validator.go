@@ -1,16 +1,14 @@
-// Package validator mirrors diagflow/core/validator.py — four-layer
-// hallucination control. Layers 1–2 are deterministic (no LLM); layer 3 is an
-// independent LLM review; layer 4 is retry-with-feedback in the caller.
+// Package validator implements deterministic conclusion checks: layer 1
+// (format) and layer 2 (root cause references evidence). The retry-with-feedback
+// loop lives in diagagent. An independent LLM review (layer 3) is not implemented.
 package validator
 
 import (
 	"strings"
 )
 
-// Validator performs multi-layer conclusion validation.
+// Validator performs the deterministic (LLM-free) conclusion checks.
 type Validator struct {
-	// Layer 3+ uses the Anthropic client directly (wrapped by the caller via
-	// Verify). For deterministic layers 1–2 no client is needed.
 	evidenceKeywords []string
 }
 
@@ -30,8 +28,7 @@ func New() *Validator {
 }
 
 // ValidateLayer checks layers 1–2 deterministically. Returns (pass, feedback).
-// The LLM review (layer 3) is invoked by the caller through the DiagAgent when
-// a validation client is available.
+// There is no LLM review layer; the caller retries synthesis with feedback once.
 func (v *Validator) ValidateLayer(rootCause string, suggestions []string, evidenceCount int) (bool, string) {
 	// Layer 1: format
 	if rootCause == "" || len(rootCause) < 10 {

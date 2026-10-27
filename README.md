@@ -42,8 +42,10 @@ when deterministic logic cannot already answer the question.
 
 ### Single-Agent ReAct + YAML Strategy
 
-- **SDK-native tool use**: `DiagAgent` uses `Anthropic().messages.create(...)` with the
-  tool schema, relying on the SDK's native `tool_use` loop rather than a hand-rolled ReAct.
+- **SDK-native tool use**: `DiagAgent` calls `Anthropic().messages.create(...)` and runs
+  the returned `tool_use` blocks in an explicit loop with turn, tool-call, and stall
+  budgets (`internal/diagagent/convergence.go`), rather than parsing a text-based ReAct
+  transcript.
 - **YAML-driven deterministic phase**: `data/strategies/*.yaml` defines *what* to collect
   (which tools, in what order, at what priority). Same-priority steps run in parallel.
   Steps support conditional branching via `llm_decide` + `if_decision`.
@@ -59,16 +61,19 @@ when deterministic logic cannot already answer the question.
 | Node commands | `ssh_exec` (read-only allowlist), `call_umr_agent` |
 | Knowledge | `fingerprint_match`, `deepwiki_query` |
 
-### Hybrid RAG (ChromaDB + BM25)
+### Knowledge Base and Retrieval (in-memory)
 
-- **Fingerprint Match**: MD5-based exact match for known issues (fast path, zero LLM cost)
-- **Semantic Search**: ChromaDB / Milvus Lite vector similarity for intent-level matching
-- **BM25**: Keyword-level exact match for error codes and stack traces
-- **RRF Fusion**: Reciprocal Rank Fusion to merge both result sets
-- Falls back to a Milvus Lite backend via `DIAGFLOW_VECTOR_STORE__BACKEND=milvus`.
-- **Current limitation**: the embedding provider is still a stub
-  (`HasRealEmbeddings()` is false), so only exact fingerprints work today. The
-  KB is shared across requests in one process, but is not durable across restarts.
+- **Fingerprint Match**: MD5 over `component:error_pattern:version` — exact match for
+  known issues (fast path, zero LLM cost). This is the only KB path active today.
+- **BM25 + vector retrieval**: both are implemented in `internal/rag/retriever` and
+  `internal/rag/vectorstore`, but Phase 1 gates the whole search path on
+  `HasRealEmbeddings()`, which is always false while the embedder is a stub — so
+  neither semantic nor BM25 retrieval runs during a diagnosis.
+- **Vector store**: the only backend is an in-memory store. The `chromadb` /
+  `milvus` config fields and `DIAGFLOW_VECTOR_STORE__BACKEND` are accepted but do
+  not select a backend yet.
+- **Current limitation**: the KB is process-scoped and non-durable — it is lost on
+  restart. Auto-indexing (Phase 5) writes into that in-memory KB.
 
 ### Validation and failure semantics
 
@@ -140,6 +145,8 @@ Endpoints:
 | GET    | `/metrics`          | Prometheus metrics |
 | POST   | `/api/v1/diagnose`  | Run a diagnosis |
 | POST   | `/api/v1/investigate` | Intent-driven investigation (forces `investigate=true`) |
+| POST   | `/api/v1/diagnose/stream` | Same diagnosis, narrated as SSE step events |
+| GET    | `/`                 | Embedded single-page operator console |
 
 ```bash
 curl -s localhost:8080/api/v1/diagnose \
@@ -171,9 +178,12 @@ export DIAGFLOW_MCP_MAX_SEARCH_NODES=32
 ./diagflow-mcp -port 8090
 ```
 
-The MCP server is the **single cluster-access gateway**: DiagFlow agents hold
-no cluster credentials, only a bearer token. It exposes, over Streamable HTTP
-(`POST /mcp`, JSON-RPC 2.0), with per-agent bearer-token auth and audit logging.
+When `DIAGFLOW_MCP_BASE_URL` is configured, the MCP server is the **single
+cluster-access gateway**: DiagFlow agents hold no cluster credentials, only a
+bearer token. Without it, the agent falls back to the in-process adapter in
+`internal/infra` and therefore uses the cluster credentials itself. The MCP
+server exposes its tools over Streamable HTTP (`POST /mcp`, JSON-RPC 2.0), with
+per-agent bearer-token auth and audit logging.
 
 It has two data planes:
 
@@ -184,6 +194,7 @@ It has two data planes:
 | `get_node_info` | access API `describe_node` (includes per-node services) |
 | `get_cluster_services` | access API `get_cluster_service` |
 | `get_node_log` | read-only SSH `tail`/`grep` on the node |
+| `list_logs` | read-only SSH: list log files under the standard `/var/log` roots |
 | `search_logs` | read-only SSH, fanned out across nodes in parallel |
 | `get_node_metrics` | read-only SSH (`uptime`, `free`, `df`) |
 | `get_base_info` | read-only SSH (`hostname`, `uname`, `nproc`, `free`) |
@@ -296,36 +307,39 @@ diagflow/
 │   ├── server/              # HTTP API, SSE, embedded operator console
 │   └── observability/       # MySQL history + Markdown report rendering
 ├── deploy/                  # Dockerfile, Kubernetes manifests, deploy scripts
-├── tests/                   # Legacy Python reference tests
 └── data/
     └── strategies/          # YAML diagnostic strategies
 ```
 
 ## Production Deployment
 
-DiagFlow ships with a **production adapter** (`diagflow/infra/`) that bridges the
-agent to real UHadoop infrastructure. The Tool layer is identical in demo and
+DiagFlow ships with a **production adapter** (`internal/infra/`) that bridges the
+agent to real UHadoop infrastructure. The tool layer is identical in demo and
 production — only the data source changes.
 
 ### Architecture: Demo vs Production
 
 ```
 Demo Mode (default):
-  Tools → SimulatedCluster (pre-built scenarios)
+  Tools → simulated.Cluster (pre-built scenarios)
          ↓
   Local mock data (no network calls)
 
 Production Mode (DIAGFLOW_MODE=production):
-  Tools → RealCluster
+  Tools → RealCluster (or the MCP gateway when DIAGFLOW_MCP_BASE_URL is set)
          ↓
-  ┌──────────────────────────────────────────────────┐
-  │ UCloudServiceDiscovery → ZooKeeper (NameContainer) │
-  │                 (find uhadoop-manage, monitor)     │
-  │ NodeInfoClient → uhadoop-manage HTTP API           │
-  │                 (cluster/node metadata — NO MySQL) │
-  │ UmrAgentClient → http://[ipv6]:65431/?Action=...   │
-  │                 (HMAC-SHA1 signed, port of util/agent.js) │
-  └──────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────┐
+  │ infra.ZoneClusterAccess → ZooKeeper                        │
+  │   resolves /NS/uhadoop/set<zone>/UHADOOPAccessHTTP         │
+  │ infra.AccessClient → access HTTP API                       │
+  │   describe_cluster / list_node / describe_node /           │
+  │   get_cluster_service   (metadata only — NO direct MySQL)  │
+  │ infra.SSHExec / LogReader → read-only SSH to the node      │
+  │   (IPv6 preferred; credentials come from describe_cluster) │
+  └────────────────────────────────────────────────────────────┘
+
+  UmrAgentClient (HMAC-SHA1, port 65431) exists but is not wired into
+  RealCluster; node operations currently use read-only SSH.
 ```
 
 ### Reused Infrastructure Patterns
@@ -335,7 +349,7 @@ The production adapter carries over existing uhadoop-task patterns in Go:
 | uhadoop-task (Node.js) | DiagFlow (Go) | Notes |
 |----------------------|----------------|-------|
 | `libs/name_container.js` | `infra.ZoneClusterAccess` | ZK-based service discovery |
-| `util/agent.js` | `infra.RealCluster` / MCP node tools | Read-only node operations |
+| `util/agent.js` | `infra.UmrAgentClient` (unwired) / `infra.SSHExec` / MCP node tools | Read-only node operations |
 | `controllor/describe_cluster_nodes.js` | `infra.AccessClient` | Node metadata via uhadoop-access HTTP API |
 
 ### Deploy to Kubernetes
@@ -389,9 +403,11 @@ The MCP server is zone-scoped too: `DIAGFLOW_ZONE` (the ZooKeeper set id) and
 
 ### Safety Guarantees
 
-- **No direct MySQL access**: node/cluster metadata comes from the zone's UHadoop
-  access HTTP action API, discovered via ZooKeeper. DiagFlow never touches
-  cluster node tables directly.
+- **No direct MySQL metadata access**: node/cluster metadata comes from the zone's
+  UHadoop access HTTP action API, discovered via ZooKeeper. DiagFlow never touches
+  cluster node tables directly. (Operators can still run a single read-only
+  `mysql -e "SELECT ..."` through `ssh_exec`; that is a node command, not a
+  metadata source.)
 - **No write operations on nodes**: the MCP server only ever runs read-only
   commands. Node log/metrics/base-info/process/YARN commands are built from
   fixed templates; `ssh_exec` runs through a command allowlist that rejects
@@ -400,5 +416,6 @@ The MCP server is zone-scoped too: `DIAGFLOW_ZONE` (the ZooKeeper set id) and
 - **Timeout isolation**: every tool call has a configurable timeout; failures
   degrade gracefully rather than blocking diagnosis.
 - **Audit trail**: every diagnosis produces a step-by-step trace; optional MySQL
-  persistence (via `observability/db.py`) records diagnosis history and step logs
-  when the database is reachable.
+  persistence (`internal/observability/store`, schema in `sql/schema.sql`)
+  records a diagnosis summary when the database is reachable. It degrades to
+  disabled when MySQL is unset or unreachable.

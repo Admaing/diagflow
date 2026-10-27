@@ -2,6 +2,9 @@
 
 > 可直接整体粘贴给 Claude Code / Cursor 等使用。
 > 目标：把 Go 版 DiagFlow 从「能跑的 demo」提升到真正的生产级别。
+>
+> **状态说明**：本文是一份生产化改造任务书快照。下面的"项目真实背景"已按
+> 2026-10-27 的代码校准；清单中的部分项已经落地，完成状态以代码和 README 为准。
 
 ---
 
@@ -11,20 +14,26 @@
 
 ## 一、项目真实背景
 
-- DiagFlow 是面向大数据平台（Flink/HDFS/YARN/Kafka/Spark）的 **AI 故障根因诊断 Agent**，已用 **Go 重写**（原 Python 实现已删除）。
+- DiagFlow 是面向大数据平台（Flink/HDFS/YARN/Kafka/Spark）的 **AI 故障根因诊断 Agent**，已用 **Go 重写**（原 Python 实现已从仓库删除）。
 - **LLM 链路**：Anthropic SDK 形态 → modelverse 代理（api.modelverse.cn）→ DeepSeek 后端。所有 LLM 调用都是 `Anthropic().messages.create(...)` 形态。
-- **核心架构**（`internal/diagagent/diag_agent.go` 的 `DiagAgent`）五阶段流水线：
-  1. KB 语义检索（0 LLM）
-  2. YAML 策略确定性执行（`internal/strategy/strategy.go`，同优先级并行）
+- **核心架构**（`internal/diagagent/diag_agent.go` 的 `Agent`）五阶段流水线：
+  1. KB 指纹匹配（0 LLM；语义检索因 embedder stub 关闭）
+  2. YAML 策略确定性执行（`internal/strategy/strategy.go`，同优先级并发）
   3. SDK 原生 ReAct + DeepWiki 已知 bug 验证（`internal/tools/v3tools/v3tools.go`）
-  4. 结论合成 + 独立校验（`internal/validator/validator.go`，4 层幻觉控制）
-  5. 高置信度自动入库（`internal/rag/knowledgebase/`）
-- **5 个工具**：query_yarn、ssh_exec（只读）、call_umr_agent、deepwiki_query、fingerprint_match。
-- **RAG**：混合检索（向量 + BM25 + RRF 融合），向量库抽象在 `internal/rag/vectorstore/`。
-- **基础设施层**（`internal/infra/infra.go`）：umrAgent HMAC-SHA1 签名调用（IPv6:65431）、NodeInfoClient 走 uhadoop-manage HTTP API。**约束：禁止直连 MySQL 取节点信息，禁止 SSH 写操作。**
-- **可观测性**：`internal/observability/`（event tracker、Markdown 报告），`sql/schema.sql` 定义持久化表。
+  4. 结论合成 + 确定性校验（`internal/validator/validator.go`，L1/L2 + 一次重试）
+  5. 高置信度自动入库（`internal/rag/knowledgebase/`，进程内存）
+- **11 个工具**：query_node_log、list_logs、search_logs、query_metrics、query_yarn、
+  get_cluster_info、list_nodes、ssh_exec（只读）、call_umr_agent、deepwiki_query、
+  fingerprint_match。
+- **RAG**：指纹精确匹配可用；BM25/向量检索与 RRF 已实现，但向量半部分因
+  embedding provider 是 stub 而关闭（`HasRealEmbeddings()` 恒为 false）。
+- **基础设施层**（`internal/infra/`）：ZK 服务发现 + access HTTP API 取元数据，
+  节点日志/指标/配置走只读 SSH；`UmrAgentClient` 尚未接入 `RealCluster`。
+  **约束：禁止直连 MySQL 取节点元数据，禁止 SSH 写操作。**
+- **可观测性**：`internal/metrics`（`/metrics`）、`internal/observability/store`
+  （可选 MySQL 摘要落库）、`internal/observability/report`（Markdown）。
 - **部署**：`deploy/`（Dockerfile、deploy.sh、kubernetes/）。
-- **测试**：Go 原生测试，7 个测试文件 / 18 个源文件——覆盖率明显不足。
+- **测试**：Go 原生测试，当前 27 个测试文件 / 41 个源文件。
 - 文档：`LINK_CHAIN.md`（链路）、`OBSERVABILITY.md`（可观测性设计）。
 
 ## 二、生产就绪改造清单（按优先级执行）
@@ -39,7 +48,7 @@
 
 ### P1 — 安全
 
-6. **Secrets 管理**：API key、HMAC 密钥不得出现在代码/日志/错误信息中；支持从环境变量或 secret 文件注入；审计 `deploy/` 与 `deploy.example/` 中的默认凭证。
+6. **Secrets 管理**：API key、HMAC 密钥不得出现在代码/日志/错误信息中；支持从环境变量或 secret 文件注入；审计 `deploy/` 中的默认凭证。
 7. **SSH 只读保证**：在代码层面（命令白名单/黑名单 + 测试）强制 ssh_exec 只读约束，而不是靠约定。
 8. **注入防护**：所有 SQL 用参数化查询；所有 shell 调用禁止字符串拼接。
 9. **HTTP 服务加固**（如有 HTTP 入口）：限流、认证、CORS、请求体大小限制、优雅关闭（graceful shutdown + drain）。

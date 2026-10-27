@@ -1,5 +1,5 @@
-// Package memory mirrors diagflow/core/memory.py — evidence pooling and
-// session memory shared across the diagnostic engine.
+// Package memory provides the evidence pool and session memory shared across
+// the diagnostic engine.
 package memory
 
 import (
@@ -31,8 +31,7 @@ func NewEvidence(sourceAgent, category, summary, detail string, confidence float
 	}
 }
 
-// ToDict returns a map representation (excluding RawData), matching
-// Evidence.to_dict in Python.
+// ToDict returns a map representation (excluding RawData) for reports and logs.
 func (e Evidence) ToDict() map[string]any {
 	return map[string]any{
 		"source_agent": e.SourceAgent,

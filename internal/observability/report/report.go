@@ -1,5 +1,5 @@
-// Package report mirrors diagflow/observability/report.py — Markdown rendering
-// of a diagnosis report.
+// Package report renders a diagnosis report as Markdown for the API, CLI, and
+// persisted history.
 package report
 
 import (

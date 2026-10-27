@@ -1,227 +1,114 @@
-# 生产级 LLM Agent 可观测体系
+# DiagFlow 可观测性现状
 
-> ⚠️ **本文为设计提案，尚未实现。** Prometheus metrics、JSON 结构化日志（Loki/ES）、
-> Langfuse 集成目前均**未落地到代码**。现有可观测性仅有：
-> MySQL 可选持久化（`observability/db.py`）+ event tracker（`observability/event_tracker.py`）
-> + Markdown 报告（`observability/report.py`）。下文描述的是目标架构，供后续演进参考。
+> 本文按 **2026-10-27 的 Go 实现**校准。旧版本把本文件写成"设计提案、尚未实现"，
+> 与代码不符——Prometheus 指标、JSON 结构化日志、MySQL 历史都已落地。下文先列
+> 已实现部分，再列仍然缺失的部分。
 
-## 架构总览
+## 一、已实现
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      DiagFlow Pod                           │
-│                                                             │
-│  DiagAgent.diagnose()                                       │
-│    │                                                        │
-│    ├──→ /tmp/diagflow/<event_id>/  文件追溯 (已有)           │
-│    │    保留用于单次诊断 debug                                │
-│    │                                                        │
-│    ├──→ Prometheus metrics        ← 新增: 聚合监控          │
-│    │    diagnosis_total, phase_duration_seconds,             │
-│    │    kb_hit_total, llm_token_total, ...                   │
-│    │                                                        │
-│    └──→ MetricsLogger              ← 新增: 结构化指标        │
-│         JSON Lines → Loki/Elasticsearch                     │
-│         按 event_id 串联全链路                                │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│                        外部服务                              │
-│                                                             │
-│  Prometheus + Grafana  ─→ 聚合面板、告警规则                  │
-│  Loki/ES              ─→ 全链路搜索、event_id 全文检索         │
-│  Langfuse (可选)       ─→ LLM 专项: token 成本、prompt 版本    │
-└─────────────────────────────────────────────────────────────┘
-```
+### 1. Prometheus `/metrics`
 
----
+两个二进制都暴露 `GET /metrics`（文本格式，`internal/metrics` 是零依赖实现）。
 
-## Layer 1: Prometheus Metrics（必须）
+| 指标 | 类型 | 标签 | 来源 |
+| :-- | :-- | :-- | :-- |
+| `diagflow_diagnoses_total` | Counter | `component`, `status` | HTTP 诊断结束 |
+| `diagflow_diagnosis_duration_ms` | Histogram | — | HTTP 诊断耗时 |
+| `diagflow_tool_calls_total` | Counter | `tool`, `status` | 策略与 ReAct 工具调用 |
+| `diagflow_llm_calls_total` | Counter | — | 成功的 LLM 调用 |
+| `diagflow_llm_errors_total` | Counter | — | 失败的 LLM 调用 |
+| `diagflow_llm_tokens_total` | Counter | — | input + output token |
+| `mcp_tool_calls_total` | Counter | `agent`, `tool`, `status` | MCP 网关 |
+| `mcp_tool_duration_ms` | Histogram | — | MCP 工具耗时 |
+| `mcp_rejected_total` | Counter | `reason` | 鉴权 / ACL / 限流拒绝 |
 
-解决"整体怎么样"的问题，在 diagflow/observability/ 下新增:
+直方图使用固定桶（100ms ~ 300s），详见 `internal/metrics/metrics.go`。
 
-```python
-# diagflow/observability/metrics.py
+### 2. 结构化日志
 
-from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, generate_latest
+两个 `main.go` 都用 `slog.NewJSONHandler` 输出 JSON。HTTP 层有：
 
-registry = CollectorRegistry()
+- `requestIDMiddleware`：生成或透传 `X-Request-ID`，响应头回显；
+- `recoverMiddleware`：panic 恢复，返回 500 并记录；
+- 每次诊断结束记录一行 `diagnosis done`，带 `component`、`status`、
+  `confidence`、`duration_ms`、`warnings`、`phases`。
 
-# 诊断结果
-diagnosis_total = Counter(
-    "diagflow_diagnosis_total", "Total diagnoses",
-    ["component", "problem_type", "outcome"],  # outcome: kb_hit/react/skip
-    registry=registry,
-)
-diagnosis_duration = Histogram(
-    "diagflow_diagnosis_duration_seconds", "Diagnosis duration",
-    ["component"],
-    buckets=[1, 5, 10, 30, 60, 120, 300],
-    registry=registry,
-)
+MCP 网关的每条审计日志额外带 `agent`、`cluster_id`、`request_id`、
+`duration_ms`、`result_bytes`。
 
-# 各 Phase 耗时
-phase_duration = Histogram(
-    "diagflow_phase_duration_seconds", "Per-phase duration",
-    ["phase"],  # phase_1, phase_2, phase_3, phase_4
-    buckets=[0.001, 0.01, 0.1, 1, 5, 10, 30, 60],
-    registry=registry,
-)
+### 3. 诊断历史（可选 MySQL）
 
-# KB 命中
-kb_hit_total = Counter(
-    "diagflow_kb_hit_total", "KB hit count",
-    ["match_type"],  # semantic (Phase 1), fingerprint (Phase 2.5)
-    registry=registry,
-)
+`internal/observability/store`：
 
-# LLM 调用
-llm_call_total = Counter(
-    "diagflow_llm_call_total", "LLM call count",
-    ["phase", "model"],  # phase_3_react, phase_4_synthesis, phase_4_validate
-    registry=registry,
-)
-llm_token_total = Counter(
-    "diagflow_llm_token_total", "Token consumption",
-    ["phase", "direction"],  # direction: input/output
-    registry=registry,
-)
+- `store.New` 在 `DIAGFLOW_MYSQL__HOST` 为空或连不上时返回 `nil`，服务以
+  "持久化关闭"继续运行；
+- `Save` 在后台 goroutine 执行，带 5s 超时，失败只记 warning；
+- 写入 `diagnosis_history` 摘要（根因、置信度、建议、证据数、耗时、LLM 次数），
+  **不写逐步追踪**；
+- `ListBySession` 用于冷启动时回放会话历史。
 
-# 工具结果
-tool_result_total = Counter(
-    "diagflow_tool_result_total", "Tool call results",
-    ["tool", "status"],  # status: success/error/timeout
-    registry=registry,
-)
+表结构见 `sql/schema.sql`（`diagnosis_history`、`diagnosis_feedback` 等）。
 
-# 置信度分布
-confidence_distribution = Counter(
-    "diagflow_confidence_total", "Confidence distribution",
-    ["confidence"],  # high/medium/low
-    registry=registry,
-)
-```
+### 4. 会话热缓存
 
-在 DiagAgent 中使用:
+`internal/server/session.go`：`session_id → 最近 50 条诊断`，TTL 2 小时，
+每分钟清理过期项。未命中时从 MySQL 回放；`session_history` 会注入到下一次
+诊断的 context，供模型参考。
 
-```python
-# diag_agent.py 关键节点埋点
+### 5. SSE 步骤流
 
-async def diagnose(self, ...):
-    start = time.monotonic()
+`POST /api/v1/diagnose/stream` 把 Agent 的 `onEvent` 消息转换成 SSE 事件：
 
-    # Phase 1
-    t0 = time.monotonic()
-    hit = self._kb_match(context)
-    phase_duration.labels(phase="phase_1").observe(time.monotonic() - t0)
-    if hit:
-        kb_hit_total.labels(match_type="semantic").inc()
-        diagnosis_total.labels(component, problem_type, "kb_hit").inc()
-        diagnosis_duration.labels(component).observe(time.monotonic() - start)
-        return ...
+- `step`：一条步骤叙述，`kind` 取 `log` / `tool_call` / `tool_result` /
+  `tool_error` / `strategy` / `warn` / `phase` / `notice`；
+- `report`：最终报告（JSON + Markdown）；
+- `failed`：诊断失败的错误码与消息；
+- `done`：结束，带总耗时。
 
-    # Phase 2
-    t0 = time.monotonic()
-    await self._run_strategy(...)
-    phase_duration.labels(phase="phase_2").observe(time.monotonic() - t0)
+另有 15s 心跳，防止代理/浏览器断开空闲连接。普通 `/api/v1/diagnose` 只返回
+最终报告。
 
-    # Phase 3 — 每次 LLM 调用
-    # 在 _run_react 里:
-    #   llm_call_total.labels(phase="phase_3_react", model=self.model).inc()
-    #   llm_token_total.labels(phase="phase_3_react", direction="input").inc(input_tokens)
+### 6. 健康检查
 
-    # Phase 4
-    #   llm_call_total.labels(phase="phase_4_synthesis", model=self.model).inc()
-    #   confidence_distribution.labels(confidence=confidence).inc()
+- `/healthz`：进程存活；
+- `/readyz`：依赖矩阵 `llm`、`cluster_discovery`、`mcp`、`persistence`、
+  `api_auth`。关键依赖不可用返回 503，可选依赖不可用返回 200 + `degraded`；
+- MCP 网关 `/readyz`：ZK 能解析 `UHADOOPAccessHTTP` 且其端口可连。
 
-    # 收尾
-    diagnosis_duration.labels(component).observe(time.monotonic() - start)
-```
+### 7. Markdown 报告
 
-Grafana 面板:
-
-```
-┌─ DiagFlow Dashboard ─────────────────────────────────┐
-│                                                      │
-│  📊 诊断量 (每小时)      📊 KB 命中率趋势             │
-│  📊 各 Phase P99 延迟    📊 LLM Token 消耗 (日/周)    │
-│  📊 工具错误率            📊 置信度分布                │
-│  📊 诊断量 Top-N 故障类型                              │
-│                                                      │
-│  告警规则:                                            │
-│  - diagnosis_total 骤降 >50% → 服务异常                │
-│  - tool_result_total{status="error"} >10% → 工具故障   │
-│  - llm_token_total 日消耗超预算 → 成本告警              │
-│  - phase_duration P99 >120s → 诊断超时                 │
-└──────────────────────────────────────────────────────┘
-```
+`internal/observability/report` 把 `Report` 渲染成 Markdown（根因、置信度、
+建议、证据链、降级警告），HTTP 响应和 CLI 共用。
 
 ---
 
-## Layer 2: 结构化日志 → Loki/ES（强烈建议）
+## 二、尚未实现
 
-解决"某次诊断为什么失败"的检索问题:
+以下能力**不在代码中**，不要按旧版本文档假设它们存在：
 
-```python
-# 在 configure_logging() 中输出 JSON 格式
-{
-  "ts": "2026-07-28T10:30:00Z",
-  "level": "INFO",
-  "event_id": "diag-1753698600-1234",  # ← 贯穿全链路
-  "phase": "phase_3",
-  "msg": "yarn_logs returned 3 FAILED apps",
-  "tool": "query_yarn",
-  "duration_ms": 234
-}
-```
-
-这样在 Loki 里 `{event_id="diag-1753698600-1234"}` 就能看到完整链路，不需要 SSH 到 Pod 上翻文件。
+| 能力 | 现状 |
+| :-- | :-- |
+| OpenTelemetry tracing | 未接入，没有 span |
+| Langfuse / LLM 专项分析 | 未接入 |
+| 每 Phase 耗时直方图 | 只有整体诊断耗时，没有 `phase` 标签 |
+| KB 命中率 / 置信度分布指标 | 只出现在报告字段和 MySQL 行里，没有 Prometheus 指标 |
+| 工具级 token / 成本拆分 | 只有全局 `diagflow_llm_tokens_total` |
+| 文件式 event tracker | 没有；事件只走结构化日志和报告 |
+| MCP 审计落库 | 只有结构化日志，没有 MySQL 表 |
+| Grafana Dashboard / 告警规则 | 仓库里没有 |
+| 诊断步骤持久化 | MySQL 只存摘要，不存每步证据 |
 
 ---
 
-## Layer 3: Langfuse（可选，按需开启）
+## 三、建议的下一步（按优先级）
 
-解决"LLM 专项分析":
+| 优先级 | 事项 | 解决什么 |
+| :---: | :-- | :-- |
+| P0 | 给 `diagflow_diagnoses_total` 增加 `outcome`（ok/degraded/error）并核对告警 | "服务还正常吗？" |
+| P1 | 增加 Phase 耗时直方图 + KB 命中/置信度计数器 | 定位慢在哪、KB 是否有效 |
+| P1 | 把 MCP 审计写入 MySQL 或 Loki | 跨 Pod 追溯 |
+| P2 | OpenTelemetry（HTTP → Agent → 工具 → MCP） | 全链路 trace |
+| P2 | Langfuse 可配置开关 | prompt 版本 / 成本 / 质量评估 |
 
-| 需求 | Prometheus 能否满足 | Langfuse 价值 |
-|------|:---:|------|
-| 今天 token 花了多少钱 | ✅ Counter | 更精细的 per-session 分解 |
-| 哪个 prompt 版本更好 | ❌ | ✅ A/B 测试 + 评估 |
-| 用户评价"这个诊断不对" | ❌ | ✅ 反馈收集 + 关联 trace |
-| LLM 输出质量退化检测 | ❌ | ✅ 评估数据集自动跑分 |
-| 单次 LLM 调用的完整 I/O | ⚠️ 太详细不适合 Prometheus | ✅ Trace 详情页 |
-
-**建议**: 先上 Prometheus + Loki，Langfuse 留集成接口但不作为依赖。代码中只加一个可配置的回调:
-
-```python
-# config.py
-@dataclass
-class ObservabilityConfig:
-    langfuse_enabled: bool = False
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-
-# diag_agent.py — LLM 调用埋点
-async def _call_llm(self, ...):
-    if self._langfuse:
-        trace = self._langfuse.trace(name="diagnosis", metadata={"event_id": event_id})
-        generation = trace.generation(name="react_step", model=self.model, ...)
-        # ... LLM call ...
-        generation.end(output=response)
-
-    # 始终记录 Prometheus metrics (不依赖 Langfuse)
-    llm_call_total.labels(...).inc()
-```
-
----
-
-## 优先级
-
-| 优先级 | 组件 | 几天能上线 | 解决什么 |
-|:---:|------|:---:|------|
-| P0 | Prometheus metrics | 1 天 | "系统还正常吗？" |
-| P0 | JSON 结构化日志 + event_id | 0.5 天 | "这次诊断为什么失败？" |
-| P1 | Grafana Dashboard | 0.5 天 | "趋势怎样？" |
-| P1 | Prometheus 告警规则 | 0.5 天 | "出问题了通知谁？" |
-| P2 | Langfuse 集成 (可选开关) | 1 天 | "LLM 成本/AI 质量细节" |
-
-**Langfuse 不是不需要，但不是第一优先级。** Prometheus metrics 覆盖了 80% 的生产监控需求，Langfuse 解决的是那 20% 的 LLM 专项分析。先上线跑起来，等真实流量把前两层验证过了，再按需开 Langfuse。
+所有新增埋点都应复用 `internal/metrics`，保持零外部依赖；日志继续用 `slog`，
+不要把 token、密码、`passwd` 写进结构化字段。

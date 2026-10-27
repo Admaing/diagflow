@@ -1,282 +1,271 @@
 # DiagFlow 完整链路与设计原理
 
+> 本文描述 **Go 实现**（`go-rewrite` 分支）。Python 原版已从仓库移除。
+
 ## 一、总览
 
-一次诊断从用户输入到输出报告，经过 **5 个 Phase**。
+DiagFlow 有两条诊断路径，共用工具层、证据池和合成器：
+
+| 路径 | 入口 | 适用场景 |
+| :-- | :-- | :-- |
+| `Diagnose` | `Agent.Diagnose()` / `POST /api/v1/diagnose` | 已知组件 + 问题类型的标准诊断 |
+| `Investigate` | `Agent.Investigate()` / `POST /api/v1/investigate` | 告警驱动的开放式内部排查 |
+
+`Diagnose` 是 **5 个 Phase** 的流水线：
+
+```
+Phase 1  KB 指纹快路径       0 LLM
+Phase 2  YAML 策略确定性取证 0 LLM（llm_decide 分支除外）
+Phase 3  SDK ReAct           LLM
+Phase 4  结构化合成 + 校验    LLM + 确定性检查
+Phase 5  高置信度自动归档     0 LLM
+```
 
 核心设计哲学：**能用确定性逻辑解决的问题，绝不浪费 LLM 调用**。
+
+> 历史上的 **Phase 2.5（证据驱动 MD5 匹配）已删除**。原 Python 版在 Phase 2
+> 之后再做一次指纹匹配；Go 版把指纹匹配统一放在 Phase 1，避免同一能力出现在
+> 两个阶段。`diag_agent.go` 中保留了一条说明注释。
 
 ---
 
 ## 二、全景数据流
 
 ```
-用户: "uhadoop-1rz1p 的 Flink 任务一直挂，OOM"
-  │
+浏览器 / curl / CLI
+  │  POST /api/v1/diagnose        （或 /diagnose/stream、/investigate）
   ▼
-┌─ ConversationManager ─────────────────────────────────────┐
-│ 1. _extract_info()  → component=flink, problem=job_failure│
-│ 2. 缺失字段追问 → version=1.17, cluster_id=uhadoop-1rz1p │
-│ 3. 组装 context:                                           │
-│    {component:"flink", problem:"job_failure",              │
-│     cluster_id:"uhadoop-1rz1p", version:"1.17",            │
-│     detail:"任务一直挂 OOM"}                                │
-└──────────────────────┬────────────────────────────────────┘
-                       ▼
-┌─ DiagAgent.diagnose(context) ────────────────────────────┐
-│                                                          │
-│  context → Phase 1 → Phase 2 → Phase 2.5                  │
-│                      ↓ (未命中)                            │
-│            Phase 3 → Phase 4 → Phase 5                    │
-│                                                          │
-│  输出: DiagnosisReport {                                 │
-│    root_cause: "TaskManager 2G heap 配 4 slots 导致 OOM", │
-│    confidence: "high",                                   │
-│    suggestions: ["增大 heap 到 4G", "减少 slot 到 2"],    │
-│    evidence_summary: [...],                              │
-│  }                                                       │
-│                                                          │
-│  呈现: render_report() → Markdown                        │
-│         → Web UI / CLI 显示给用户                         │
-└──────────────────────────────────────────────────────────┘
+internal/server
+  ├─ authMiddleware        静态 Bearer token（配置了 DIAGFLOW_AUTH_TOKEN 时）
+  ├─ recover + requestID   崩溃恢复、X-Request-ID
+  └─ runDiagnosis()
+       ├─ resolveCluster()             demo → simulated.Cluster
+       │                               production → infra.RealCluster
+       ├─ knowledgeBase()              进程级 KB（首次调用时创建）
+       ├─ BuildV3Tools(cluster, kb, mcpClient, deepwikiClient)
+       ├─ Agent.New(...) + RegisterTools
+       └─ Agent.Diagnose() / Investigate()
+            ▼
+       Report { status, root_cause, confidence, suggestions,
+                evidence_summary, phases_run, llm_calls, ... }
+            ▼
+       report.Render() → Markdown
+       store.EntryFromReport() → session cache + 可选 MySQL（异步）
 ```
+
+关键点：
+
+- **每个请求新建一个 Agent 和工具集**，所以 `eventID`、`llmCalls` 等状态不会
+  在并发请求之间共享。
+- **KB 是进程级的**（`Server.knowledgeBase()` 用 `sync.Once` 创建），跨请求
+  共享，但只存在内存中，重启即丢失。
+- **CLI 路径**（`cmd/diagflow/main.go` 无 `-serve`）使用同样的 Agent，只是
+  数据源换成 `simulated.Cluster` 或一次性的 `RealCluster`。
 
 ---
 
-## 三、Phase 1 — KB 语义检索
+## 三、Phase 1 — KB 指纹快路径
 
 ```
-输入: context = {component:"flink", problem:"job_failure", detail:"一直挂 OOM"}
+输入: context = {component:"flink", problem:"job_failure",
+                 error:"java.lang.OutOfMemoryError", version:"1.14.3"}
 
 ┌──────────────────────────────────────────────────────────┐
-│ _kb_match(context)                                       │
+│ fingerprintHit(component, context)                       │
 │                                                          │
-│  if embedder 没有 API key:                                │
-│    → return None  (跳过，fallback hash 向量没有语义)       │
-│                                                          │
-│  query = "flink job_failure 一直挂 OOM"                   │
-│    ↓                                                     │
-│  kb.search(query, n=3)                                   │
-│    ├─ ChromaDB 语义: cosine 相似度                        │
-│    ├─ BM25 关键词: "OOM", "flink" 词频匹配               │
-│    └─ RRF 融合: 两个排名加权合并                          │
-│    ↓                                                     │
-│  fusion_score > 0.01 ?                                   │
-│    ✅ → 返回缓存的 root_cause + suggestions               │
-│    ❌ → return None                                      │
+│  errorPatternFromContext()                               │
+│    优先取 error_pattern / error / exception              │
+│    否则在 problem/detail/message 中匹配 RAG.ErrorKeywords │
+│         ↓                                                │
+│  kb.FingerprintMatch(component, pattern, version)        │
+│    fp = MD5("component:pattern:version")[:16]            │
+│    dict 精确查找 → root_cause + suggestions              │
+│         ↓                                                │
+│  命中且数据完整 → 直接返回 Report（0 LLM）                │
+│  未命中 → 进入 Phase 2                                    │
 └──────────────────────────────────────────────────────────┘
-
-LLM 调用: 0
-耗时: <10ms (有真实 embedder) / 0ms (跳过)
 ```
 
-**设计原因**: 很多生产问题会重复出现。上次诊断过的 OOM 问题，下次用户描述类似现象时应该直接返回已知结论。用自然语言语义检索而非精确关键词，因为用户描述不规范（"挂了"、"报错"、"一直重启"都有可能是同一个问题）。
+**语义检索目前不可用**：`KnowledgeBase.HasRealEmbeddings()` 恒为 `false`
+（`internal/rag/embedder` 的 provider 是 stub），所以 `kbMatch()` 这一段
+永远不会执行。源码里的门控是真实的，不是遗漏。
+
+LLM 调用：0
+耗时：亚毫秒级（字典查找）
 
 ---
 
 ## 四、Phase 2 — YAML 策略确定性执行
 
 ```
-输入: strategy = load_strategy("flink", "job_failure")
-
-┌─ 策略文件 data/strategies/flink_job_failure.yaml ──────┐
-│ steps:                                                  │
-│   - action: fingerprint_match    priority: 0  (串行)    │
-│   - tool: query_yarn             priority: 1  (并行)    │
-│     params: {action: list_apps}                         │
-│   - tool: ssh_exec               priority: 1  (并行)    │
-│     params: {node_name: "{{ context.cluster_id }}-master1",│
-│              cmd: "grep ERROR .../taskmanager.log"}    │
-│   - tool: call_umr_agent         priority: 2  (并行)    │
-│     params: {action: GetBaseInfo}                       │
-│   - tool: deepwiki_query         priority: 3  (串行)    │
-│     params: {component: flink,                          │
-│              question: "OOM known bugs"}                │
-└──────────────────────────────────────────────────────────┘
-
-执行流程:
-  Priority 0:  fingerprint_match → 跳过 (Phase 1 已覆盖)
-  Priority 1:  query_yarn ────┐
-              ssh_exec ───────┤ asyncio.gather 并行
-                              ↓
-  Priority 2:  call_umr_agent → 获取节点基础信息
-  Priority 3:  deepwiki_query → 查已知 bug
-
-每步结果 → EvidencePool.add(Evidence(...))
-
-LLM 调用: 0
-耗时: 取决于网络/SSH，同 priority 并行所以只算最慢的那个
+strategy.Load(component, problemType, strategiesDir)
+  ├─ <component>_<problem>.yaml
+  ├─ <component>_default.yaml
+  └─ 内置 defaultStrategy()（文件都不存在时）
 ```
 
-**设计原因**: 确定性步骤不需要 AI 判断——查 YARN 列表、grep 日志、获取节点信息，这些是**机械操作**。用 YAML 描述策略允许运维人员在不改代码的情况下调整排查流程。同优先级并行减少等待时间。
+策略示例（`data/strategies/flink_checkpoint_failure.yaml`）：
+
+```yaml
+steps:
+  - action: fingerprint_match
+    priority: 0
+
+  - action: tool_call
+    tool: ssh_exec
+    params:
+      node_name: "master1"
+      cmd: "grep -E 'Checkpoint|barrier' /data/flink/log/jobmanager.log | tail -100"
+    priority: 1
+
+  - action: tool_call
+    tool: deepwiki_query
+    priority: 2
+
+knowledge_base:
+  fingerprint: true
+  semantic_search: true
+  bm25_search: true
+```
+
+执行流程（`Agent.runStrategy`）：
+
+1. `GroupByPriority()` 把步骤按 `priority` 分组。
+2. 同一优先级内的 `tool_call` 步骤用 **goroutine 并发执行**（`sync.WaitGroup`）。
+3. 每个批次结束后处理 `llm_decide` 步骤，最多产生一个 `branch_decision`；
+   后续步骤通过 `if_decision` 决定是否执行。
+4. 每步结果写入 `memory.EvidencePool`：
+   - 成功 → confidence 0.8
+   - 工具返回失败 → confidence 0.2（降级证据，不中断流程）
+   - 工具 panic → confidence 0.0，并记录一条错误证据
+
+参数支持 `{{ context.x }}` 模板渲染（`Step.RenderParams`）。
+
+LLM 调用：0（`llm_decide` 分支会调用 1 次）
 
 ---
 
-## 五、Phase 2.5 — 证据驱动的 MD5 精确匹配
+## 五、Phase 3 — SDK ReAct（LLM 自由探索）
 
-```
-证据收集完后，EvidencePool 里有具体错误信息:
-  "java.lang.OutOfMemoryError: Java heap space"
-  "gc overhead 95.5%"
-  "exit code 137"
+`Agent.runReact()` 直接使用 Anthropic SDK 的 `tool_use` block 循环，预算如下：
 
-┌──────────────────────────────────────────────────────────┐
-│ _kb_evidence_match(context, evidence)                    │
-│                                                          │
-│  for ev in evidence.all():                               │
-│    for kw in ["OutOfMemoryError","OOM","FATAL",...]:     │
-│      if kw in ev.detail:                                 │
-│        hit = kb.fingerprint_match("flink", kw, "1.17")   │
-│          ↓ MD5("flink:OutOfMemoryError:1.17") = exact    │
-│        if hit → ✅ 首次真正有意义的精确匹配                │
-│                                                          │
-│  匹配到 → 返回 DiagnosisReport (跳过 LLM)                 │
-│  未匹配 → 进入 Phase 3                                    │
-└──────────────────────────────────────────────────────────┘
+| 限制 | 值 | 位置 |
+| :-- | :-- | :-- |
+| 最大轮数 | 12 | `Diagnose` 调用参数 |
+| 最大工具调用数 | 20 | `maxReActToolCalls` |
+| 连续无新证据轮数 | 3 | 停滞检测 |
+| 单条工具结果回灌上限 | 8000 字符 | `maxReActResultChars` |
+| 单次工具执行超时 | 30s | `toolTimeout` |
 
-LLM 调用: 0
-耗时: <1ms (dict 查找)
-```
+另外两项收敛机制（`convergence.go`）：
 
-**设计原因**: Phase 1 用自然语言找相似，Phase 2.5 用**具体错误类名**找精确匹配。两个阶段互补：Phase 1 宽松召回，Phase 2.5 精确确认。因为此时日志已经收集到，错误关键词是确定的，MD5 精确匹配才有意义。
+- **重复调用短路**：同一 `(tool, canonical args)` 再次出现时不再打到集群，
+  直接把已有的重复提示回灌给模型。
+- **结果指纹**：只有内容指纹变化才算"新证据"，避免"重复读同一个日志"
+  无限重置停滞计数。
+
+ReAct 阶段的输出只有在 `meaningfulConclusion()` 为真时才作为一条
+confidence 0.7 的证据入池。
+
+LLM 调用：1~12 次（通常 3~6 次）
 
 ---
 
-## 六、Phase 3 — SDK ReAct（LLM 自由探索）
+## 六、Phase 4 — 结构化合成 + 确定性校验
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ _run_react(task, evidence, tools, max_turns=12)          │
-│                                                          │
-│ system prompt: 注入 topology + evidence summary + playbook│
-│                                                          │
-│ Loop:                                                    │
-│   LLM 收到 messages + tool schemas                       │
-│   → LLM 决定调用哪个 tool                                 │
-│   → 执行 tool.handler(**args)                             │
-│   → tool result 追加到 messages                           │
-│   → 3 轮无新证据? → 强制输出结论                           │
-│   → 12 轮上限                                            │
-│                                                          │
-│ Tool schemas 暴露给 LLM:                                  │
-│   query_yarn:     "查 YARN 应用状态"                      │
-│   ssh_exec:       "SSH 到节点执行只读命令" ✅安全过滤      │
-│   deepwiki_query: "查开源组件已知 bug"                    │
-│   fingerprint_match: "查历史案例"                         │
-│   call_umr_agent: "调 umrAgent 获取日志"                  │
-│                                                          │
-│ LLM 自主决定: 先查 YARN 找节点 → SSH 看日志 → DeepWiki    │
-│              验证是不是已知 bug → 输出分析                 │
-└──────────────────────────────────────────────────────────┘
-
-LLM 调用: 1~12 次 (通常 3-6 次)
-耗时: 取决于 LLM API 延迟和工具执行时间
+synthesize(pool, context)
+  ├─ 把 EvidencePool.Summary() + context 发给 LLM
+  ├─ 只暴露一个工具 report_diagnosis
+  ├─ ToolChoice = "any"（thinking 模型不接受强制指定某个 tool）
+  └─ 解析 root_cause / confidence / suggestions
+        ↓
+validator.ValidateLayer()
+  ├─ Layer 1（0 LLM）：根因非空且 ≥10 字符、建议非空、证据数 > 0
+  └─ Layer 2（0 LLM）：根因必须引用证据关键词（中英文都覆盖）
+        ↓
+  失败 → 带 feedback 重试 synthesize() 一次
+  仍失败 → 返回 ErrNoConclusion
 ```
 
-**设计原因**: Phase 2 是预先规划的确定性路径，但实际排查中常有意想不到的情况——日志路径不标准、YARN 没注册、错误在另一个服务上。Phase 3 让 LLM **自由探索**，它可以根据返回结果动态调整下一步。
+**没有 Layer 3（独立 LLM 复核）**。`README` 和旧版 `LINK_CHAIN` 曾把它描述为
+"四层校验"；实际代码只有确定性两层 + 一次重试。`validator.go` 的注释已按此
+校准。
 
-**3-turn 停滞检测**: 如果连续 3 次工具调用都没发现新证据，说明可能网络不通、服务未安装、或日志格式异常，强制 LLM 基于现有证据输出结论而不是无限循环。
+失败语义：
+
+| 情况 | 返回值 | HTTP |
+| :-- | :-- | :-- |
+| LLM 调用失败 | `ErrLLMUnavailable` | 502 `llm_unavailable` |
+| 合成不出可验证结论 | `ErrNoConclusion` | 422 `no_conclusion` |
+| ReAct 失败但证据足够 | `status=degraded` + warnings | 200 |
+| 请求超时 | `context.DeadlineExceeded` | 504 `diagnosis_timeout` |
+
+**失败绝不会被包装成根因。**
 
 ---
 
-## 七、Phase 4 — 结构化合成 + 四层验证
+## 七、Phase 5 — KB 自动归档
+
+只有同时满足以下条件才归档：
+
+- `confidence == "high"`
+- `status == "ok"`（没有降级警告）
+
+归档内容：
 
 ```
-┌─ _synthesize() ─────────────────────────────────────────┐
-│                                                          │
-│  发送 EvidencePool 摘要 + context 给 LLM                  │
-│  tool_choice = {"type": "tool", "name": "report_diagnosis"}│
-│  强制 LLM 调用结构化 tool:                                │
-│    {                                                     │
-│      "root_cause": "TaskManager 2G heap 4 slots → OOM",  │
-│      "confidence": "high",                               │
-│      "suggestions": ["增大 heap 4G","减少 slots 到 2"],   │
-│      "missing_evidence": ["未获取 JM 日志"],              │
-│      "evidence_citations": ["strategy: OOM in taskmanager"]│
-│    }                                                     │
-│                                                          │
-│  ✅ 结构化输出 → 不需要字符串解析 → 100% 可靠提取          │
-└──────────────────────────────────────────────────────────┘
-                         ↓
-┌─ ConclusionValidator.validate() ─────────────────────────┐
-│                                                          │
-│  Layer 1 (0 LLM): 格式检查                                │
-│    root_cause < 10 字符? → FAIL                           │
-│    suggestions 为空? → FAIL                               │
-│    evidence_count == 0? → FAIL                            │
-│                                                          │
-│  Layer 2 (0 LLM): 交叉验证                                │
-│    root_cause 里有没有引用证据关键词(error/log/oom/...)?   │
-│    没有 → 可能是编造的(幻视) → FAIL                        │
-│                                                          │
-│  Layer 3 (1 LLM): AI 验证                                 │
-│    独立 LLM 检查: root_cause 够不够具体?                   │
-│                  suggestions 可不可执行?                   │
-│    tool_use 结构化输出 {passes: bool, reason: str}         │
-│                                                          │
-│  Layer 4 (max 2): 重试带反馈                              │
-│    FAIL → 把 feedback 传回 _synthesize() 重新生成          │
-└──────────────────────────────────────────────────────────┘
-
-LLM 调用: 1 (合成) + 1 (验证) = 2
-额外重试: 0~2 (仅验证失败时)
+kb.AddCase(component, errorPattern, version, rootCause, suggestions)
+  ├─ MD5 指纹 → 进程内 fingerprints map
+  └─ 文本 + metadata → 进程内 vector store
 ```
 
-**设计原因**: 
-- **结构化输出**替代字符串解析 — 之前用 `if line.startswith("ROOT_CAUSE:")` 解析，输出格式稍微变化就丢失结果。`tool_choice` 强制模型输出 JSON，100% 可靠。
-- **四层验证** — LLM 的诊断可能"说得有道理但完全不对"(幻视)。Layer1-2 是确定性规则，零成本拦截明显问题；Layer3 让另一个 LLM 独立审查；Layer4 给修正机会。
+**边界**：KB 是进程级内存，重启即丢；向量检索因 embedding stub 关闭，所以
+"下次相同错误 → 0 LLM"只在同一进程生命周期内成立。跨重启的持久化只有 MySQL
+诊断历史（`internal/observability/store`），它不参与 Phase 1 匹配。
+
+LLM 调用：0
 
 ---
 
-## 八、Phase 5 — KB 自动归档（带质量门控）
+## 八、Investigate — 意图驱动排查
+
+`Agent.Investigate()` 是另一条编排：
 
 ```
-仅当 confidence == "high" 才入库:
-
-┌─ _kb_index() ───────────────────────────────────────────┐
-│                                                          │
-│  提取错误关键词:                                          │
-│    for ev in evidence.all():                             │
-│      for kw in error_keywords:                          │
-│        if kw in ev.detail → error = kw                   │
-│                                                          │
-│  kb.add_case(                                            │
-│    component="flink",                                    │
-│    error_pattern="OutOfMemoryError",  ← 精确错误关键词    │
-│    version="1.17",                                       │
-│    root_cause="TaskManager 2G heap ...",                 │
-│    suggestions=["增大 heap", "减少 slots"],              │
-│  )                                                       │
-│    ↓                                                     │
-│    ├─ MD5("flink:OutOfMemoryError:1.17") → _fingerprints │
-│    └─ ChromaDB.upsert(embedding) → 持久化                 │
-│                                                          │
-│  下次有相同的 "flink OOM 1.17" → Phase 2.5 精确命中       │
-└──────────────────────────────────────────────────────────┘
-
-LLM 调用: 0
+1. buildInvestigationPlan()
+     LLM 结合告警上下文生成 2~5 个排查意图
+     失败 → 回退到单个默认意图 + degraded 警告
+2. 对每个意图：
+     searchSimilarIntent()
+       命中历史 → 直接复用历史根因，跳过工具执行
+     否则 runIntent()
+       工具调用 → 日志片段 → LLM 判断
+       若怀疑组件 Bug：
+         buildDeepwikiPrompt() → dispatchDeepwiki()
+3. synthesizeFromTrace()
+     任一意图命中历史 → 直接返回该历史根因（不再合成）
+     否则把 trace 转成 EvidencePool，复用 synthesize()
 ```
 
-**设计原因**: 
-- **门控** — 只归档高置信度的诊断。`confidence=low` 的推测性结论入库会污染知识库，导致后续诊断被错误结果误导。
-- **双写** — 同时写入内存 dict（Phase 2.5 精确匹配用）和 ChromaDB（Phase 1 语义检索用 + 重启恢复）。
+输出报告额外带 `Trace`（每个意图的执行步骤、日志片段、判断、DeepWiki 结果）。
+
+`Agent.ConfirmCorrect()` 可以把确认过的排查思路写回 KB，但目前**没有 HTTP
+入口**，只有测试调用它。
 
 ---
 
 ## 九、LLM 调用次数汇总
 
-| Phase | 说明 | LLM 调用 |
-|-------|------|:--------:|
-| 1 | KB 语义检索 | 0 |
-| 2 | YAML 策略执行 | 0 |
-| 2.5 | MD5 精确匹配 | 0 |
-| 3 | SDK ReAct | 3~6 (通常) |
-| 4 | 合成 + 验证 | 2 |
-| 5 | KB 归档 | 0 |
-| **合计 (新增案例)** | | **5~8** |
-| **合计 (命中缓存)** | | **0** |
-
-对比纯 ReAct 方案（每个工具调用都经过 LLM，通常 15+ 次），减少了 ~60% 的 LLM 调用和 ~58% 的 token 消耗。
+| 阶段 | 说明 | LLM 调用 |
+| :-- | :-- | :--: |
+| Phase 1 | KB 指纹匹配 | 0 |
+| Phase 2 | YAML 策略执行 | 0（`llm_decide` 除外） |
+| Phase 3 | SDK ReAct | 3~6（通常） |
+| Phase 4 | 合成 + 校验 + 最多一次重试 | 1~2 |
+| Phase 5 | KB 归档 | 0 |
+| **合计（新案例）** | | **4~8** |
+| **合计（指纹命中）** | | **0** |
 
 ---
 
@@ -284,44 +273,38 @@ LLM 调用: 0
 
 ### 1. 确定性优先于智能
 
-```
-Phase 1 (语义搜索) → Phase 2 (YAML执行) → Phase 2.5 (MD5匹配)
-         ↓                    ↓                  ↓
-      0 LLM               0 LLM              0 LLM
-```
-
-大部分生产问题是重复的。历史案例 + 确定性证据收集能覆盖 80% 的场景，根本不需要 LLM。
+指纹匹配、YAML 取证都是 0 LLM。生产问题大量重复，能用历史结论和固定步骤
+回答的，不进入模型。
 
 ### 2. 结构化优于自由文本
 
-```
-旧版: LLM 输出自由文本 → 正则/字符串解析 → 容易失败
-新版: tool_choice 强制 JSON → 100% 可靠
-```
-
-LLM 的输出不可控——换行位置、大小写、格式都会有变化。`tool_choice` 让模型输出 JSON 而不是自然语言，消除了所有的解析不确定性。
+合成阶段只暴露 `report_diagnosis` 一个工具，模型必须输出结构化字段；
+文本回退只接受明确可解析的结论，任意散文不会被当作根因。
 
 ### 3. 分层验证，越往前成本越低
 
-```
-Layer 1 (格式规则) → 0ms, 0 LLM
-Layer 2 (交叉验证) → 0ms, 0 LLM
-Layer 3 (AI 审查)  → ~500ms, 1 LLM
-Layer 4 (重试)     → 额外 LLM 调用
-```
+格式和证据引用检查是纯字符串操作（0 成本），先拦住明显不可用的输出；
+只有它们通过后才值得考虑（尚未实现的）模型复核。
 
-90% 的问题在 Layer 1-2 就被拦截了（根因太短、没建议、没证据）。不需要把每种情况都送到 LLM 去验证。
+### 4. 知识沉淀，但当前是进程级
 
-### 4. 知识沉淀，越用越聪明
+诊断 → 指纹归档 → 同进程内复用。真正跨重启的知识沉淀需要先接上持久化
+向量库和真实 embedding provider，这两项目前都没有落地。
 
-```
-Phase 5: 每次成功诊断 → 自动入库
-         ↓
-Phase 1: 下次类似问题 → 语义检索命中 (0 LLM)
-Phase 2.5: 下次相同错误 → MD5 精确命中 (0 LLM)
-                      ↓
-              系统积累的诊断越来越多
-              LLM 调用越来越少
-```
+---
 
-这是一个**闭环**——诊断→归档→复用→无需 LLM。系统运行时间越长，历史案例越多，LLM 调用的比例越低。
+## 十一、关键代码索引
+
+| 能力 | 文件 |
+| :-- | :-- |
+| 五阶段主流程 | `internal/diagagent/diag_agent.go` `Diagnose()` |
+| 意图排查 | `internal/diagagent/investigate_plan.go` `Investigate()` |
+| ReAct 预算 / 收敛 | `internal/diagagent/convergence.go` |
+| YAML 策略 | `internal/strategy/strategy.go`、`data/strategies/*.yaml` |
+| 证据池 | `internal/memory/memory.go` |
+| 校验 | `internal/validator/validator.go` |
+| 指纹 KB | `internal/rag/knowledgebase/knowledgebase.go` |
+| HTTP 服务 | `internal/server/server.go`、`sse.go` |
+| 工具定义 | `internal/tools/v3tools/v3tools.go` |
+| 生产数据源 | `internal/infra/infra.go`、`clusteraccess.go`、`sshlog.go` |
+| MCP 网关 | `internal/mcpserver/server.go` |

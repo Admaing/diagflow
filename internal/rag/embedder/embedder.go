@@ -1,4 +1,5 @@
-// Package embedder mirrors diagflow/rag/embedder.py — text → embedding vectors.
+// Package embedder produces text embeddings. The provider is currently a stub:
+// HasRealEmbeddings is always false, so callers must not rely on semantic vectors.
 package embedder
 
 import (

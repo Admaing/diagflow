@@ -1,5 +1,6 @@
-// Package diagagent mirrors diagflow/core/diag_agent.py — the single-agent
-// five-phase diagnostic engine powered by the Anthropic SDK's native tool use.
+// Package diagagent is the single-agent diagnostic engine. Diagnose runs the
+// five-phase pipeline; Investigate runs the intent-driven path. Both use the
+// Anthropic SDK's tool_use blocks under explicit turn and tool-call budgets.
 package diagagent
 
 import (

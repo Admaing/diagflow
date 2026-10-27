@@ -1,5 +1,6 @@
-// Package knowledgebase mirrors diagflow/rag/knowledge_base.py — closed-loop
-// historical case reuse with MD5 fingerprint fast-path and hybrid search.
+// Package knowledgebase implements closed-loop historical case reuse: an MD5
+// fingerprint fast-path plus BM25/vector search. The vector half stays disabled
+// while the embedder is a stub (see HasRealEmbeddings).
 package knowledgebase
 
 import (

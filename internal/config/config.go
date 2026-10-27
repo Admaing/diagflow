@@ -1,8 +1,10 @@
-// Package config centralizes all tunables, mirroring diagflow/config.py.
+// Package config centralizes all tunables. It is the single source of defaults
+// for the CLI, the HTTP server, and the MCP gateway.
 //
 // Values are loaded from environment variables (DIAGFLOW_<SECTION>__<KEY>,
-// DIAGFLOW_LOG_LEVEL, DEPSEEK_API_KEY/LLM_API_KEY, OPENAI_API_KEY) with the
-// same defaults as the Python implementation.
+// DIAGFLOW_LOG_LEVEL, DEEPSEEK_API_KEY/LLM_API_KEY, OPENAI_API_KEY). Nested
+// values are applied after the flat aliases, so the nested form wins where both
+// name the same field.
 package config
 
 import (
@@ -13,7 +15,7 @@ import (
 	"sync"
 )
 
-// LLMConfig mirrors LLMConfig in config.py.
+// LLMConfig holds model endpoint, credentials, and output-language settings.
 type LLMConfig struct {
 	APIKey      string
 	BaseURL     string
@@ -27,7 +29,9 @@ type LLMConfig struct {
 	Language string
 }
 
-// VectorStoreConfig mirrors VectorStoreConfig.
+// VectorStoreConfig holds vector-store settings. Only the in-memory backend is
+// implemented; Backend, ChromaPersistDir, and MilvusDBPath are accepted for
+// compatibility but do not select a backend yet.
 type VectorStoreConfig struct {
 	Backend          string
 	CollectionName   string
@@ -36,29 +40,31 @@ type VectorStoreConfig struct {
 	MilvusDBPath     string
 }
 
-// RAGConfig mirrors RAGConfig.
+// RAGConfig holds retrieval tuning.
 type RAGConfig struct {
 	ErrorKeywords []string
 }
 
-// ComponentsConfig mirrors ComponentsConfig (component → GitHub repo).
+// ComponentsConfig maps a component name to its upstream GitHub repo.
 type ComponentsConfig struct {
 	RepoMap map[string]string
 }
 
-// UmrAgentConfig mirrors UmrAgentConfig.
+// UmrAgentConfig holds the umrAgent transport settings (not wired into
+// RealCluster yet).
 type UmrAgentConfig struct {
 	Port     int
 	TimeoutS int
 }
 
-// SecurityConfig mirrors SecurityConfig.
+// SecurityConfig holds ssh_exec allow/deny lists layered over the built-in
+// read-only allowlist.
 type SecurityConfig struct {
 	SSHAllowed   []string
 	SSHForbidden []string
 }
 
-// MySQLConfig mirrors MySQLConfig.
+// MySQLConfig holds the optional diagnosis-history database connection.
 type MySQLConfig struct {
 	Host     string
 	Port     int
@@ -163,7 +169,7 @@ type Config struct {
 	Zone          string
 }
 
-// Default returns a Config populated with the same defaults as config.py.
+// Default returns a Config populated with DiagFlow's built-in defaults.
 func Default() *Config {
 	c := &Config{}
 
