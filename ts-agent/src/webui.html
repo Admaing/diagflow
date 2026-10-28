@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>DiagFlow · 监控排查</title>
+<style>
+  :root {
+    --bg: #0a0f1e;
+    --panel: #111830;
+    --panel-2: #0d1327;
+    --panel-3: #17203c;
+    --text: #e9edf8;
+    --muted: #8c97b6;
+    --faint: #5d6887;
+    --border: #222c4a;
+    --border-strong: #2e3b61;
+    --accent: #6b8dff;
+    --accent-2: #9a7bff;
+    --ok: #3ddc97;
+    --warn: #ffb454;
+    --err: #ff6b81;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(900px 480px at 12% -8%, rgba(107, 141, 255, .22), transparent 60%),
+      radial-gradient(700px 420px at 92% 0%, rgba(154, 123, 255, .14), transparent 55%),
+      var(--bg);
+    min-height: 100vh;
+  }
+  a { color: var(--accent); }
+  .shell { max-width: 1320px; margin: 0 auto; padding: 28px 24px 48px; }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    margin-bottom: 22px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark {
+    width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center;
+    background: linear-gradient(140deg, var(--accent), var(--accent-2));
+    box-shadow: 0 10px 30px rgba(107, 141, 255, .28);
+    font-weight: 800; font-size: 19px; color: #0a0f1e; letter-spacing: -.5px;
+  }
+  h1 { margin: 0; font-size: 19px; letter-spacing: -.2px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .status { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 12px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--muted); font-size: 12.5px; white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .pill.ok { color: var(--ok); border-color: rgba(61, 220, 151, .35); background: rgba(61, 220, 151, .08); }
+  .pill.ok .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .pill.warn { color: var(--warn); border-color: rgba(255, 180, 84, .35); background: rgba(255, 180, 84, .08); }
+  .pill.warn .dot { background: var(--warn); }
+  .pill.err { color: var(--err); border-color: rgba(255, 107, 129, .35); background: rgba(255, 107, 129, .08); }
+  .pill.err .dot { background: var(--err); }
+  .layout { display: grid; grid-template-columns: 390px minmax(0, 1fr); gap: 18px; align-items: start; }
+  .card {
+    background: linear-gradient(180deg, rgba(23, 32, 60, .55), rgba(13, 19, 39, .55));
+    border: 1px solid var(--border); border-radius: 18px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .22);
+    backdrop-filter: blur(8px);
+  }
+  .form { padding: 20px; position: sticky; top: 18px; }
+  .result { min-height: 640px; display: flex; flex-direction: column; overflow: hidden; }
+  .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--faint); margin: 0 0 12px; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 5px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
+  .seg label { position: relative; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg span {
+    display: block; text-align: center; padding: 8px 10px; border-radius: 8px;
+    color: var(--muted); font-size: 13px; cursor: pointer; transition: .15s ease;
+  }
+  .seg input:checked + span { background: linear-gradient(140deg, rgba(107, 141, 255, .22), rgba(154, 123, 255, .18)); color: var(--text); box-shadow: inset 0 0 0 1px rgba(107, 141, 255, .35); }
+  .field { margin-bottom: 13px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field .hint { color: var(--faint); font-size: 11.5px; margin-top: 4px; }
+  input, select, textarea {
+    width: 100%; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    font: inherit; outline: none; transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(107, 141, 255, .15); }
+  textarea { resize: vertical; min-height: 84px; font-family: var(--mono); font-size: 12.5px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 11px; border: 1px solid var(--border-strong);
+    padding: 11px 16px; color: var(--text); background: var(--panel-3); transition: .15s ease;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary {
+    width: 100%; border: 0; font-weight: 650; color: #081020;
+    background: linear-gradient(140deg, var(--accent), var(--accent-2));
+    box-shadow: 0 12px 30px rgba(107, 141, 255, .25);
+  }
+  button.primary:hover { filter: brightness(1.06); }
+  button:disabled { opacity: .55; cursor: not-allowed; filter: grayscale(.3); }
+  .toolbar { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border); background: rgba(10, 15, 30, .35); }
+  .toolbar .title { font-weight: 650; font-size: 14px; }
+  .toolbar .meta { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .toolbar .mini { padding: 6px 10px; font-size: 12px; border-radius: 8px; }
+  .stream { padding: 16px 18px; max-height: 330px; overflow: auto; border-bottom: 1px solid var(--border); }
+  .stream:empty { display: none; }
+  .step { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px dashed rgba(34, 44, 74, .55); }
+  .step:last-child { border-bottom: 0; }
+  .kind { font-family: var(--mono); font-size: 11px; color: var(--faint); white-space: nowrap; }
+  .kind.tool_call { color: var(--accent); }
+  .kind.tool_result { color: var(--ok); }
+  .kind.tool_error, .kind.warn { color: var(--warn); }
+  .kind.phase { color: var(--accent-2); }
+  .step .text { color: var(--muted); word-break: break-word; white-space: pre-wrap; }
+  .step .text strong { color: var(--text); font-weight: 600; }
+  .report { padding: 20px 22px 26px; overflow: auto; }
+  .empty { display: grid; place-items: center; flex: 1; padding: 40px; color: var(--faint); text-align: center; }
+  .empty h2 { color: var(--muted); font-size: 16px; margin: 0 0 6px; font-weight: 600; }
+  .empty p { margin: 0; font-size: 12.5px; max-width: 420px; }
+  .cause { font-size: 17px; line-height: 1.55; font-weight: 600; margin: 8px 0 16px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+  .badge { padding: 5px 10px; border-radius: 999px; font-size: 11.5px; border: 1px solid var(--border); color: var(--muted); }
+  .badge.high { color: var(--ok); border-color: rgba(61, 220, 151, .35); background: rgba(61, 220, 151, .07); }
+  .badge.medium { color: var(--warn); border-color: rgba(255, 180, 84, .35); background: rgba(255, 180, 84, .07); }
+  .badge.low { color: var(--err); border-color: rgba(255, 107, 129, .35); background: rgba(255, 107, 129, .07); }
+  .h { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin: 20px 0 10px; }
+  .h:first-child { margin-top: 0; }
+  ol.suggestions { margin: 0; padding-left: 20px; }
+  ol.suggestions li { margin: 7px 0; color: var(--text); }
+  .evidence { display: grid; gap: 8px; }
+  .ev { border: 1px solid var(--border); background: var(--panel-2); border-radius: 10px; padding: 10px 12px; }
+  .ev .src { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+  .ev .sum { margin-top: 4px; color: var(--text); font-size: 12.8px; }
+  .ev details { margin-top: 6px; }
+  .ev summary { cursor: pointer; color: var(--faint); font-size: 11.5px; }
+  .ev pre { margin: 8px 0 0; padding: 10px; background: #070b16; border-radius: 8px; overflow: auto; font-family: var(--mono); font-size: 11.5px; color: var(--muted); max-height: 240px; }
+  .trace { display: grid; gap: 10px; }
+  .trace .item { border-left: 2px solid var(--border-strong); padding: 2px 0 2px 12px; }
+  .trace .intent { font-weight: 600; font-size: 13px; }
+  .trace .judge { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+  .error { margin: 16px 18px; padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(255, 107, 129, .35); background: rgba(255, 107, 129, .08); color: #ffc2cb; }
+  .error code { color: var(--err); }
+  .warnbox { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255, 180, 84, .3); background: rgba(255, 180, 84, .07); color: #ffd79a; font-size: 12.5px; }
+  .foot { margin-top: 16px; color: var(--faint); font-size: 11.5px; }
+  .muted { color: var(--muted); }
+  .hide { display: none !important; }
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+    .form { position: static; }
+    .result { min-height: 480px; }
+    .stream { max-height: 260px; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="brand">
+      <div class="mark">D</div>
+      <div>
+        <h1>DiagFlow · 监控排查</h1>
+        <div class="sub">Pi Agent SDK · 只读集群工具 · 意图排查与五阶段诊断</div>
+      </div>
+    </div>
+    <div class="status">
+      <span class="pill" id="status-pill"><span class="dot"></span><span id="status-text">检查中…</span></span>
+      <span class="pill" id="model-pill">—</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <section class="card form">
+      <div class="section-title">发起排查</div>
+      <form id="diagnose-form">
+        <div class="seg">
+          <label><input type="radio" name="mode" value="diagnose" checked><span>五阶段诊断</span></label>
+          <label><input type="radio" name="mode" value="investigate"><span>意图排查</span></label>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="component">组件</label>
+            <select id="component" required>
+              <option value="flink" selected>Flink</option>
+              <option value="hdfs">HDFS</option>
+              <option value="yarn">YARN</option>
+              <option value="spark">Spark</option>
+              <option value="hive">Hive</option>
+              <option value="kafka">Kafka</option>
+              <option value="hbase">HBase</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="problem">问题类型</label>
+            <input id="problem" list="problems" value="job_failure" required>
+            <datalist id="problems">
+              <option value="job_failure"></option>
+              <option value="checkpoint_failure"></option>
+              <option value="disk_full"></option>
+              <option value="queue_stuck"></option>
+              <option value="region_unavailable"></option>
+              <option value="oom"></option>
+            </datalist>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="cluster">集群 ID</label>
+          <input id="cluster" placeholder="uhadoop-xxxx" autocomplete="off">
+          <div class="hint">五阶段诊断必填；意图排查可留空。</div>
+        </div>
+
+        <div class="field">
+          <label for="job">任务 / Application ID</label>
+          <input id="job" placeholder="application_...（可选）" autocomplete="off">
+        </div>
+
+        <div class="field">
+          <label for="detail">现象描述</label>
+          <textarea id="detail" placeholder="例如：Flink 任务 FAILED，TaskManager 出现 OOM，最后一次 checkpoint 失败"></textarea>
+        </div>
+
+        <div class="field">
+          <label for="alert">告警 JSON（可选）</label>
+          <textarea id="alert" placeholder='{"labels":{"alertname":"FlinkOOM","severity":"P1"},"annotations":{"summary":"..."}}'></textarea>
+        </div>
+
+        <div class="field">
+          <label for="token">Bearer Token</label>
+          <input id="token" type="password" placeholder="DIAGFLOW_AUTH_TOKEN" autocomplete="off">
+          <div class="hint">只保存在本机 localStorage；页面本身不包含任何密钥。</div>
+        </div>
+
+        <button class="primary" id="submit" type="submit">开始排查</button>
+        <div class="foot">请求经 <span class="muted">diagflow-mcp</span> 只读访问集群；写操作与 <span class="muted">ssh_exec</span> 默认关闭。</div>
+      </form>
+    </section>
+
+    <section class="card result">
+      <div class="toolbar">
+        <div class="title" id="result-title">排查结果</div>
+        <button class="mini hide" id="copy-json" type="button">复制 JSON</button>
+        <button class="mini hide" id="copy-md" type="button">复制 Markdown</button>
+        <div class="meta" id="elapsed">—</div>
+      </div>
+      <div class="stream" id="stream"></div>
+      <div class="empty" id="empty">
+        <div>
+          <h2>还没有排查记录</h2>
+          <p>填写左侧表单并开始。结果会以流式步骤展示，最后给出根因、置信度、建议与证据链。</p>
+        </div>
+      </div>
+      <div class="report hide" id="report"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const form = $("diagnose-form");
+  const submit = $("submit");
+  const stream = $("stream");
+  const reportBox = $("report");
+  const empty = $("empty");
+  const errorBox = { el: null };
+  const state = { running: false, startedAt: 0, timer: null, json: null, markdown: "" };
+
+  // Token is per-browser convenience only.
+  try { $("token").value = localStorage.getItem("diagflow.ts.token") || ""; } catch (_) {}
+  $("token").addEventListener("change", () => {
+    try { localStorage.setItem("diagflow.ts.token", $("token").value.trim()); } catch (_) {}
+  });
+
+  function pill(kind, text) {
+    const el = $("status-pill");
+    el.className = "pill " + (kind || "");
+    $("status-text").textContent = text;
+  }
+
+  async function refreshStatus() {
+    try {
+      const health = await fetch("/healthz", { cache: "no-store" });
+      if (!health.ok) { pill("err", "服务不可达"); return; }
+      const readyRes = await fetch("/readyz", { cache: "no-store" });
+      let body = {};
+      try { body = await readyRes.json(); } catch (_) {}
+      if (!readyRes.ok) {
+        const bad = Object.entries(body.checks || {})
+          .filter(([, v]) => v === "unreachable" || v === "degraded")
+          .map(([k]) => k);
+        pill("err", "未就绪" + (bad.length ? " · " + bad.join(", ") : ""));
+      } else if (body.status === "degraded") {
+        pill("warn", "降级运行");
+      } else {
+        pill("ok", "就绪");
+      }
+      if (body.model) $("model-pill").textContent = body.model;
+    } catch (_) {
+      pill("err", "服务不可达");
+    }
+  }
+
+  function elapsedText() {
+    if (!state.startedAt) return "—";
+    const ms = Date.now() - state.startedAt;
+    return ms < 1000 ? ms + " ms" : (ms / 1000).toFixed(1) + " s";
+  }
+
+  function startTimer() {
+    state.startedAt = Date.now();
+    $("elapsed").textContent = elapsedText();
+    state.timer = setInterval(() => { $("elapsed").textContent = elapsedText(); }, 200);
+  }
+
+  function stopTimer() {
+    if (state.timer) clearInterval(state.timer);
+    state.timer = null;
+    $("elapsed").textContent = elapsedText();
+  }
+
+  function clearOutput() {
+    stream.textContent = "";
+    reportBox.textContent = "";
+    reportBox.classList.add("hide");
+    empty.classList.remove("hide");
+    if (errorBox.el) { errorBox.el.remove(); errorBox.el = null; }
+    $("copy-json").classList.add("hide");
+    $("copy-md").classList.add("hide");
+    state.json = null;
+    state.markdown = "";
+  }
+
+  function addStep(ev) {
+    empty.classList.add("hide");
+    const row = document.createElement("div");
+    row.className = "step";
+    const kind = document.createElement("div");
+    kind.className = "kind " + (ev.kind || "log");
+    kind.textContent = ev.kind || "log";
+    const text = document.createElement("div");
+    text.className = "text";
+    if (ev.tool) {
+      const tool = document.createElement("strong");
+      tool.textContent = ev.tool + " ";
+      text.appendChild(tool);
+    }
+    text.appendChild(document.createTextNode(ev.text || ""));
+    row.appendChild(kind);
+    row.appendChild(text);
+    stream.appendChild(row);
+    stream.scrollTop = stream.scrollHeight;
+  }
+
+  function showError(code, message) {
+    stopTimer();
+    empty.classList.add("hide");
+    const box = document.createElement("div");
+    box.className = "error";
+    const title = document.createElement("div");
+    title.textContent = "排查失败";
+    title.style.fontWeight = "650";
+    title.style.marginBottom = "4px";
+    const detail = document.createElement("div");
+    const c = document.createElement("code");
+    c.textContent = code || "error";
+    detail.appendChild(c);
+    detail.appendChild(document.createTextNode(" · " + (message || "unknown error")));
+    box.appendChild(title);
+    box.appendChild(detail);
+    reportBox.classList.remove("hide");
+    reportBox.textContent = "";
+    reportBox.appendChild(box);
+    errorBox.el = box;
+  }
+
+  function badge(confidence) {
+    const el = document.createElement("span");
+    el.className = "badge " + (confidence || "low");
+    el.textContent = confidence === "high" ? "高置信度" : confidence === "medium" ? "中置信度" : "低置信度";
+    return el;
+  }
+
+  function section(title) {
+    const h = document.createElement("div");
+    h.className = "h";
+    h.textContent = title;
+    return h;
+  }
+
+  function showReport(report, markdown) {
+    stopTimer();
+    empty.classList.add("hide");
+    reportBox.classList.remove("hide");
+    reportBox.textContent = "";
+    state.json = report;
+    state.markdown = markdown || "";
+
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.appendChild(badge(report.confidence));
+    const status = document.createElement("span");
+    status.className = "badge";
+    status.textContent = report.status === "ok" ? "完整结论" : "降级结论";
+    badges.appendChild(status);
+    if (report.matched_knowledge) {
+      const kb = document.createElement("span");
+      kb.className = "badge high";
+      kb.textContent = "命中知识库";
+      badges.appendChild(kb);
+    }
+    const ev = document.createElement("span");
+    ev.className = "badge";
+    ev.textContent = "证据 " + (report.evidence_summary || []).length;
+    badges.appendChild(ev);
+    const dur = document.createElement("span");
+    dur.className = "badge";
+    dur.textContent = Math.round(report.duration_ms || 0) + " ms";
+    badges.appendChild(dur);
+    reportBox.appendChild(badges);
+
+    reportBox.appendChild(section("根因"));
+    const cause = document.createElement("div");
+    cause.className = "cause";
+    cause.textContent = report.root_cause || "（无根因）";
+    reportBox.appendChild(cause);
+
+    if (report.warnings && report.warnings.length) {
+      const warn = document.createElement("div");
+      warn.className = "warnbox";
+      warn.textContent = "降级警告：" + report.warnings.join("；");
+      reportBox.appendChild(warn);
+    }
+
+    reportBox.appendChild(section("修复建议"));
+    const ol = document.createElement("ol");
+    ol.className = "suggestions";
+    (report.suggestions || []).forEach((s) => {
+      const li = document.createElement("li");
+      li.textContent = s;
+      ol.appendChild(li);
+    });
+    reportBox.appendChild(ol);
+
+    reportBox.appendChild(section("证据链"));
+    const evs = document.createElement("div");
+    evs.className = "evidence";
+    (report.evidence_summary || []).forEach((item) => {
+      const box = document.createElement("div");
+      box.className = "ev";
+      const src = document.createElement("div");
+      src.className = "src";
+      src.textContent = item.source_agent || "unknown";
+      const sum = document.createElement("div");
+      sum.className = "sum";
+      sum.textContent = item.summary || "";
+      box.appendChild(src);
+      box.appendChild(sum);
+      if (item.detail) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "详情";
+        const pre = document.createElement("pre");
+        pre.textContent = item.detail;
+        details.appendChild(summary);
+        details.appendChild(pre);
+        box.appendChild(details);
+      }
+      evs.appendChild(box);
+    });
+    reportBox.appendChild(evs);
+
+    if (report.trace && report.trace.steps && report.trace.steps.length) {
+      reportBox.appendChild(section("排查过程"));
+      const trace = document.createElement("div");
+      trace.className = "trace";
+      report.trace.steps.forEach((step, i) => {
+        const item = document.createElement("div");
+        item.className = "item";
+        const intent = document.createElement("div");
+        intent.className = "intent";
+        intent.textContent = (i + 1) + ". " + step.intent;
+        const judge = document.createElement("div");
+        judge.className = "judge";
+        judge.textContent = step.judgment || "";
+        item.appendChild(intent);
+        item.appendChild(judge);
+        if (step.actions && step.actions.length) {
+          const tools = document.createElement("div");
+          tools.className = "judge";
+          tools.textContent = "工具：" + step.actions.map((a) => a.tool).join(", ");
+          item.appendChild(tools);
+        }
+        trace.appendChild(item);
+      });
+      reportBox.appendChild(trace);
+    }
+
+    $("copy-json").classList.toggle("hide", !state.json);
+    $("copy-md").classList.toggle("hide", !state.markdown);
+    $("result-title").textContent = report.component + " · " + report.problem_type;
+  }
+
+  function handleChunk(chunk) {
+    let event = "message";
+    let data = "";
+    for (const line of chunk.split("\n")) {
+      if (line.startsWith("event: ")) event = line.slice(7).trim();
+      else if (line.startsWith("data: ")) data += line.slice(6);
+    }
+    if (!data) return;
+    let payload;
+    try { payload = JSON.parse(data); } catch (_) { return; }
+    if (event === "step") addStep(payload);
+    else if (event === "report") showReport(payload.report, payload.markdown);
+    else if (event === "failed") {
+      stopTimer();
+      showError(payload.code, payload.message);
+    } else if (event === "done") {
+      stopTimer();
+    }
+  }
+
+  async function readStream(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buffer.indexOf("\n\n")) >= 0) {
+        const chunk = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        handleChunk(chunk);
+      }
+    }
+  }
+
+  function parseAlert() {
+    const raw = $("alert").value.trim();
+    if (!raw) return undefined;
+    try { return JSON.parse(raw); } catch (e) { throw new Error("告警 JSON 格式错误：" + e.message); }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.running) return;
+
+    const mode = document.querySelector('input[name="mode"]:checked').value;
+    const component = $("component").value.trim();
+    const problem = $("problem").value.trim();
+    const clusterId = $("cluster").value.trim();
+    if (!component || !problem) return;
+    if (mode === "diagnose" && !clusterId) {
+      showError("cluster_id_required", "五阶段诊断必须填写集群 ID");
+      return;
+    }
+
+    let alert;
+    try { alert = parseAlert(); } catch (e) { showError("invalid_alert", e.message); return; }
+
+    const token = $("token").value.trim();
+    const payload = {
+      component,
+      problem,
+      ...(clusterId ? { cluster_id: clusterId } : {}),
+      ...($("job").value.trim() ? { job_id: $("job").value.trim() } : {}),
+      ...($("detail").value.trim() ? { detail: $("detail").value.trim() } : {}),
+      ...(alert ? { alert } : {}),
+    };
+
+    state.running = true;
+    submit.disabled = true;
+    submit.textContent = "排查中…";
+    clearOutput();
+    stream.textContent = "";
+    reportBox.classList.add("hide");
+    empty.classList.remove("hide");
+    $("result-title").textContent = mode === "diagnose" ? "五阶段诊断" : "意图排查";
+    startTimer();
+
+    try {
+      const response = await fetch("/api/v1/" + mode + "/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: "Bearer " + token } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        let body = {};
+        try { body = await response.json(); } catch (_) {}
+        const err = body.error || {};
+        showError(err.code || "http_" + response.status, err.message || response.statusText);
+      } else if (!response.body) {
+        showError("stream_unsupported", "浏览器不支持流式响应");
+      } else {
+        await readStream(response);
+      }
+    } catch (e) {
+      showError("network_error", e.message || String(e));
+    } finally {
+      state.running = false;
+      submit.disabled = false;
+      submit.textContent = "开始排查";
+      stopTimer();
+    }
+  });
+
+  async function copy(text, button) {
+    try {
+      await navigator.clipboard.writeText(text);
+      const old = button.textContent;
+      button.textContent = "已复制";
+      setTimeout(() => { button.textContent = old; }, 1200);
+    } catch (_) {}
+  }
+
+  $("copy-json").addEventListener("click", () => copy(JSON.stringify(state.json, null, 2), $("copy-json")));
+  $("copy-md").addEventListener("click", () => copy(state.markdown, $("copy-md")));
+
+  refreshStatus();
+  setInterval(refreshStatus, 30000);
+})();
+</script>
+</body>
+</html>

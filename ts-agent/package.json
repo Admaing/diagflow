@@ -12,7 +12,7 @@
     "investigate": "tsx src/cli.ts",
     "server": "tsx src/server.ts",
     "prom-mcp": "tsx src/mcp/prom-server.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').copyFileSync('src/webui.html','dist/webui.html')\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts"
   },

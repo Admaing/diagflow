@@ -137,14 +137,27 @@ npm run server
 
 | Method | Path | 说明 |
 |---|---|---|
+| GET | `/` | 内置 Web 控制台（单页，无外部依赖） |
 | GET | `/healthz` | 存活 |
-| GET | `/readyz` | 数据源 / 模型 / 鉴权状态 |
+| GET | `/readyz` | 数据源可达性 / 模型 / 鉴权状态 |
 | POST | `/api/v1/investigate` | 意图排查，同步返回 `{report, markdown}` |
 | POST | `/api/v1/investigate/stream` | 意图排查 SSE |
 | POST | `/api/v1/diagnose` | 五阶段诊断，同步返回 `{report, markdown}` |
 | POST | `/api/v1/diagnose/stream` | 五阶段诊断 SSE |
 
 SSE 事件：`step` / `report` / `failed` / `done`。
+
+### Web 控制台
+
+服务启动后打开 `http://localhost:8099/`（或 port-forward 后的本地地址）：
+
+- 选择“五阶段诊断”或“意图排查”；
+- 填组件、问题类型、集群 ID、现象、告警 JSON；
+- 粘贴 Bearer Token（`DIAGFLOW_AUTH_TOKEN`，仅存本机 localStorage）；
+- 结果以 SSE 流式步骤展示，最后渲染根因、置信度、建议、证据链和排查过程。
+
+页面是内置的单个 `webui.html`，不加载任何外部脚本/字体；所有模型输出都用
+`textContent` 渲染，不拼 HTML。
 
 ```bash
 curl -s localhost:8099/api/v1/diagnose \
@@ -200,8 +213,8 @@ npm test
 在仓库根目录构建（需要把 `data/strategies` 一起打进镜像）：
 
 ```bash
-docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.2 .
-docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.2
+docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.3 .
+docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.3
 ```
 
 运行时把 `DIAGFLOW_MCP_BASE_URL` / `DIAGFLOW_MCP_TOKEN` / `PROMETHEUS_URL` /
@@ -213,7 +226,7 @@ docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.2
 
 ```bash
 cd ..   # repo root
-export IMAGE_TAG=ts-0.1.2
+export IMAGE_TAG=ts-0.1.3
 envsubst < ts-agent/deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
 x6 -n prj-diaflow rollout status deploy/diagflow-ts
 ```

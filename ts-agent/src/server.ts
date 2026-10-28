@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import { hasLlmCredential, ensureRuntimeDirs, loadConfig, validateConfig, type AgentConfig } from "./config.js";
 import {
   ConfigError,
@@ -20,6 +22,20 @@ type WorkflowMode = "investigate" | "diagnose";
 
 const MAX_BODY_BYTES = 1 << 20;
 const HEARTBEAT_MS = 15_000;
+
+/**
+ * The console is a single self-contained HTML file next to the compiled
+ * server.js. `npm run build` copies it from src/ to dist/ so the container
+ * does not need a separate asset directory.
+ */
+const WEBUI_HTML = (() => {
+  try {
+    return fs.readFileSync(fileURLToPath(new URL("./webui.html", import.meta.url)), "utf8");
+  } catch {
+    return "<!doctype html><meta charset=\"utf-8\"><title>DiagFlow</title>" +
+      "<p>webui.html is missing from the image.</p>";
+  }
+})();
 
 interface InvestigateRequest {
   component?: string;
@@ -148,6 +164,26 @@ function main(): void {
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/ui")) {
+        response.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
+          "Content-Security-Policy":
+            "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+            "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'",
+        });
+        response.end(WEBUI_HTML);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/favicon.ico") {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
 
       if (request.method === "GET" && url.pathname === "/healthz") {
         sendJson(response, 200, { status: "ok" });
