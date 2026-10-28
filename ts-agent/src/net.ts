@@ -21,7 +21,10 @@ export function probeTcp(rawUrl: string, timeoutMs = 2_000): Promise<boolean> {
       : 80;
 
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: url.hostname, port });
+    // WHATWG URL keeps the brackets on an IPv6 literal hostname; net.connect
+    // wants the bare address.
+    const host = url.hostname.replace(/^\[|\]$/g, "");
+    const socket = net.createConnection({ host, port });
     let settled = false;
     const finish = (ok: boolean) => {
       if (settled) return;

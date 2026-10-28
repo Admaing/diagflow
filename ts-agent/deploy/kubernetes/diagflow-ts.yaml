@@ -1,7 +1,7 @@
 # DiagFlow TS agent (Pi SDK) — parallel deployment next to diagflow-go.
 #
 # Render the tag and apply:
-#   export IMAGE_TAG=ts-0.1.1
+#   export IMAGE_TAG=ts-0.1.2
 #   envsubst < deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
 #
 # Prerequisites:
@@ -37,8 +37,8 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
+        # No seccompProfile: this cluster's API server predates the field and
+        # rejects the whole manifest with "unknown field seccompProfile".
       containers:
         - name: diagflow-ts
           image: hub.ucloudadmin.com/diaflow/diagflow-ts:${IMAGE_TAG}
@@ -151,14 +151,3 @@ spec:
       port: 8099
       targetPort: 8099
   type: ClusterIP
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: diagflow-ts
-  namespace: prj-diaflow
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: diagflow-ts

@@ -21,4 +21,8 @@ COPY --from=build /src/package.json ./package.json
 COPY data/strategies ./data/strategies
 USER node
 EXPOSE 8099
-CMD ["node", "dist/server.js"]
+# Kubernetes runs the container with a read-only root filesystem, so HOME and
+# the Pi scratch dirs must live under the /tmp emptyDir. Create them defensively
+# (a failure here must not stop startup; the agent creates its own dirs too) and
+# exec node so it becomes PID 1 and receives SIGTERM directly.
+CMD ["sh", "-c", "mkdir -p \"${HOME:-/tmp}\" \"${TS_AGENT_AGENT_DIR:-/tmp/pi-agent}\" \"${TS_AGENT_WORKSPACE:-/tmp/pi-workspace}\" 2>/dev/null || true; exec node dist/server.js"]

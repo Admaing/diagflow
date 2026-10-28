@@ -1,0 +1,15 @@
+# PodDisruptionBudget for diagflow-ts.
+#
+# Kept in its own file: clusters on older API servers reject the whole
+# multi-document manifest when one kind fails validation, which would block the
+# Deployment. Apply this separately and tolerate a failure.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: diagflow-ts
+  namespace: prj-diaflow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: diagflow-ts
