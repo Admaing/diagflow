@@ -22,6 +22,9 @@ COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
 COPY --from=build /src/package.json ./package.json
 COPY ts-agent/models.json ./models.json
+# Reference DDL for the console sessions table; the server also creates it at
+# startup, this copy is for operators running the SQL by hand.
+COPY ts-agent/sql ./sql
 COPY data/strategies ./data/strategies
 USER node
 EXPOSE 8099

@@ -274,8 +274,8 @@ npm test
 在仓库根目录构建（需要把 `data/strategies` 一起打进镜像）：
 
 ```bash
-docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.4 .
-docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.4
+docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.5 .
+docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.5
 ```
 
 运行时把 `DIAGFLOW_MCP_BASE_URL` / `DIAGFLOW_MCP_TOKEN` / `PROMETHEUS_URL` /
@@ -287,7 +287,7 @@ docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.4
 
 ```bash
 cd ..   # repo root
-export IMAGE_TAG=ts-0.1.4
+export IMAGE_TAG=ts-0.1.5
 envsubst < ts-agent/deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
 x6 -n prj-diaflow rollout status deploy/diagflow-ts
 ```
