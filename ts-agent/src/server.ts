@@ -8,11 +8,14 @@ import {
   StageTimeoutError,
 } from "./errors.js";
 import type { AgentEvent, EventSink } from "./events.js";
-import type { InvestigationInput } from "./report/types.js";
+import { McpToolExecutor } from "./mcp/tool-client.js";
+import type { InvestigationInput, DiagnosisReport } from "./report/types.js";
 import { createPiRuntime } from "./runtime/pi.js";
-import type { AgentRuntime } from "./runtime/types.js";
 import { errorMessage } from "./util.js";
+import { runDiagnosis } from "./workflow/diagnose.js";
 import { runInvestigation } from "./workflow/investigate.js";
+
+type WorkflowMode = "investigate" | "diagnose";
 
 const MAX_BODY_BYTES = 1 << 20;
 const HEARTBEAT_MS = 15_000;
@@ -94,11 +97,17 @@ async function readBody(request: http.IncomingMessage): Promise<unknown> {
   return JSON.parse(raw) as unknown;
 }
 
-function toInput(body: InvestigateRequest): InvestigationInput {
+function toInput(body: InvestigateRequest, mode: WorkflowMode): InvestigationInput {
   const component = body.component?.trim();
   const problem = body.problem?.trim();
   if (!component || !problem) {
     throw Object.assign(new Error("component and problem are required"), { statusCode: 400 });
+  }
+  if (mode === "diagnose" && !body.cluster_id?.trim()) {
+    throw Object.assign(new Error("cluster_id is required for diagnose mode"), {
+      statusCode: 400,
+      code: "cluster_id_required",
+    });
   }
   return {
     component,
@@ -121,10 +130,6 @@ function authorized(request: http.IncomingMessage, config: AgentConfig): boolean
 function writeSse(response: http.ServerResponse, event: AgentEvent): void {
   response.write(`event: ${event.type}\n`);
   response.write(`data: ${JSON.stringify(event)}\n\n`);
-}
-
-async function createRuntime(config: AgentConfig, sink: EventSink): Promise<AgentRuntime> {
-  return createPiRuntime(config, sink);
 }
 
 function main(): void {
@@ -169,10 +174,12 @@ function main(): void {
         return;
       }
 
-      const isDiagnose = request.method === "POST" && url.pathname === "/api/v1/investigate";
-      const isStream =
-        request.method === "POST" && url.pathname === "/api/v1/investigate/stream";
-      if (!isDiagnose && !isStream) {
+      const stream = url.pathname.endsWith("/stream");
+      const basePath = stream ? url.pathname.slice(0, -"/stream".length) : url.pathname;
+      let mode: WorkflowMode | undefined;
+      if (request.method === "POST" && basePath === "/api/v1/investigate") mode = "investigate";
+      if (request.method === "POST" && basePath === "/api/v1/diagnose") mode = "diagnose";
+      if (!mode) {
         sendJson(response, 404, { error: { code: "not_found", message: "unknown route" } });
         return;
       }
@@ -186,10 +193,10 @@ function main(): void {
 
       await semaphore.acquire();
       try {
-        if (isStream) {
-          await handleStream(request, response, config, log);
+        if (stream) {
+          await handleStream(request, response, config, log, mode);
         } else {
-          await handleJson(request, response, config, log);
+          await handleJson(request, response, config, log, mode);
         }
       } finally {
         semaphore.release();
@@ -231,25 +238,39 @@ function main(): void {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
+async function executeWorkflow(
+  config: AgentConfig,
+  input: InvestigationInput,
+  mode: WorkflowMode,
+  sink: EventSink,
+): Promise<{ report: DiagnosisReport; markdown: string }> {
+  const runtime = await createPiRuntime(config, sink);
+  const executor = mode === "diagnose" ? await McpToolExecutor.create(config) : undefined;
+  try {
+    return mode === "diagnose" && executor
+      ? await runDiagnosis(runtime, executor, input, sink)
+      : await runInvestigation(runtime, input, sink);
+  } finally {
+    await runtime.close();
+    await executor?.close();
+  }
+}
+
 async function handleJson(
   request: http.IncomingMessage,
   response: http.ServerResponse,
   config: AgentConfig,
   log: (message: string) => void,
+  mode: WorkflowMode,
 ): Promise<void> {
   const body = (await readBody(request)) as InvestigateRequest;
-  const input = toInput(body);
-  const runtime = await createRuntime(config, () => undefined);
-  try {
-    const { report, markdown } = await runInvestigation(runtime, input, () => undefined);
-    log(
-      `done event=${report.event_id} component=${report.component} ` +
-        `status=${report.status} confidence=${report.confidence} duration_ms=${report.duration_ms}`,
-    );
-    sendJson(response, 200, { report, markdown });
-  } finally {
-    await runtime.close();
-  }
+  const input = toInput(body, mode);
+  const { report, markdown } = await executeWorkflow(config, input, mode, () => undefined);
+  log(
+    `done mode=${mode} event=${report.event_id} component=${report.component} ` +
+      `status=${report.status} confidence=${report.confidence} duration_ms=${report.duration_ms}`,
+  );
+  sendJson(response, 200, { report, markdown });
 }
 
 async function handleStream(
@@ -257,9 +278,10 @@ async function handleStream(
   response: http.ServerResponse,
   config: AgentConfig,
   log: (message: string) => void,
+  mode: WorkflowMode,
 ): Promise<void> {
   const body = (await readBody(request)) as InvestigateRequest;
-  const input = toInput(body);
+  const input = toInput(body, mode);
 
   response.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -273,22 +295,19 @@ async function handleStream(
     if (!response.writableEnded) response.write(": heartbeat\n\n");
   }, HEARTBEAT_MS);
 
-  let sink: EventSink = () => undefined;
-  let runtime: AgentRuntime | undefined;
+  const sink: EventSink = (event) => {
+    if (!response.writableEnded) writeSse(response, event);
+  };
+
   try {
-    runtime = await createRuntime(config, (event) => sink(event));
-    sink = (event) => {
-      if (!response.writableEnded) writeSse(response, event);
-    };
-    await runInvestigation(runtime, input, sink);
+    await executeWorkflow(config, input, mode, sink);
   } catch (error) {
     const status = errorStatus(error);
-    log(`failed event code=${status.code} message=${status.message}`);
+    log(`failed mode=${mode} code=${status.code} message=${status.message}`);
     writeSse(response, { type: "failed", code: status.code, message: status.message });
     writeSse(response, { type: "done", duration_ms: 0 });
   } finally {
     clearInterval(heartbeat);
-    await runtime?.close();
     if (!response.writableEnded) response.end();
   }
 }

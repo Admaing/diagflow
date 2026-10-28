@@ -101,6 +101,7 @@ export function buildSynthesisPrompt(
   trace: IntentResult[],
   context: Record<string, unknown>,
   language: string,
+  feedback?: string,
 ): string {
   return `根据以下排查记录，给出最终根因诊断：
 ${contextBlock(input)}
@@ -113,5 +114,5 @@ ${traceBlock(trace)}
 - 如果证据不足，root_cause 写“证据不足，无法给出确定结论”，confidence 用 "low"。
 - suggestions 给出 2-4 条可执行建议。
 - 只调用 report_diagnosis 工具提交，不要在正文里输出 JSON。
-${languageDirective(language)}`;
+${feedback ? `\n上一次输出未通过校验，请修正：${feedback}\n` : ""}${languageDirective(language)}`;
 }

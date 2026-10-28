@@ -32,14 +32,21 @@ import {
   buildSynthesisPrompt,
   systemPrompt,
 } from "../workflow/prompts.js";
-import type { AgentRuntime, RuntimeStats } from "./types.js";
+import type { AgentRuntime, ReactResult, RuntimeStats } from "./types.js";
+import type { DecideChoice } from "../strategy/types.js";
 
-const INTERNAL_TOOLS = new Set(["propose_intents", "report_intent", "report_diagnosis"]);
+const INTERNAL_TOOLS = new Set([
+  "propose_intents",
+  "report_intent",
+  "report_diagnosis",
+  "branch_decision",
+]);
 
 const ALLOWED_TOOLS = [
   "propose_intents",
   "report_intent",
   "report_diagnosis",
+  "branch_decision",
   "mcp__diagflow__*",
   "mcp__prom__*",
 ];
@@ -48,6 +55,7 @@ interface Captured {
   intents?: Intent[];
   intent?: { judgment: string; suspect_component_bug?: boolean };
   report?: ReportDraft;
+  decision?: string;
 }
 
 interface ToolContent {
@@ -401,11 +409,12 @@ export class PiAgentRuntime implements AgentRuntime {
     input: InvestigationInput,
     trace: IntentResult[],
     context: Record<string, unknown>,
+    feedback?: string,
   ): Promise<ReportDraft> {
     this.resetTrace();
     this.captured.report = undefined;
     await this.prompt(
-      buildSynthesisPrompt(input, trace, context, this.config.language),
+      buildSynthesisPrompt(input, trace, context, this.config.language, feedback),
       "合成诊断报告",
     );
 
@@ -415,6 +424,46 @@ export class PiAgentRuntime implements AgentRuntime {
       throw new NoConclusionError("synthesis returned no verifiable conclusion");
     }
     return draft;
+  }
+
+  async decide(prompt: string, choices: DecideChoice[]): Promise<string> {
+    this.resetTrace();
+    this.captured.decision = undefined;
+    const choiceText = choices
+      .map((choice) => `- ${choice.value}: ${choice.description ?? ""}`)
+      .join("\n");
+    await this.prompt(
+      `${prompt}\n\n请调用 branch_decision 工具，从以下值中选择一个：\n${choiceText}`,
+      "策略分支决策",
+    );
+
+    const decision =
+      (this.captured.decision as string | undefined) ||
+      this.session.getLastAssistantText()?.trim() ||
+      "";
+    if (!choices.some((choice) => choice.value === decision)) {
+      this.emitter.step("warn", `无效的分支决策: ${truncate(decision, 80) || "(empty)"}`);
+      return "";
+    }
+    return decision;
+  }
+
+  async react(
+    task: string,
+    _context: Record<string, unknown>,
+    evidenceSummary: string,
+  ): Promise<ReactResult> {
+    this.resetTrace();
+    await this.prompt(
+      `${task}\n\n已收集的证据:\n${evidenceSummary || "(none)"}\n\n` +
+        "只在确实需要时调用工具；完成后给出你的分析和根因假设。",
+      "ReAct 探索",
+    );
+    return {
+      text: this.session.getLastAssistantText()?.trim() ?? "",
+      actions: [...this.currentActions],
+      snippets: [...this.currentSnippets],
+    };
   }
 
   getStats(): RuntimeStats {
@@ -614,7 +663,23 @@ function buildCustomTools(captured: Captured): ToolDefinition[] {
     },
   });
 
-  return [proposeIntents, reportIntent, reportDiagnosis];
+  const branchDecision = defineTool({
+    name: "branch_decision",
+    label: "Choose a strategy branch",
+    description: "Choose one branch value for the current diagnostic strategy.",
+    parameters: Type.Object({
+      decision: Type.String({ description: "One of the offered branch values" }),
+    }),
+    execute: async (_toolCallId, params) => {
+      captured.decision = params.decision.trim();
+      return {
+        content: [{ type: "text" as const, text: `已选择分支: ${params.decision}` }],
+        details: {},
+      };
+    },
+  });
+
+  return [proposeIntents, reportIntent, reportDiagnosis, branchDecision];
 }
 
 export async function createPiRuntime(config: AgentConfig, sink: EventSink): Promise<AgentRuntime> {

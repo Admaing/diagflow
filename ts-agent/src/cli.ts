@@ -4,20 +4,26 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { hasLlmCredential, loadConfig, validateConfig } from "./config.js";
 import type { EventSink } from "./events.js";
+import { McpToolExecutor } from "./mcp/tool-client.js";
 import type { InvestigationInput } from "./report/types.js";
 import { createPiRuntime } from "./runtime/pi.js";
 import { errorMessage } from "./util.js";
+import { runDiagnosis } from "./workflow/diagnose.js";
 import { runInvestigation } from "./workflow/investigate.js";
 
 function usage(): string {
-  return `DiagFlow TS agent — intent-driven monitoring investigation
+  return `DiagFlow TS agent — monitoring investigation / diagnosis
 
 Usage:
-  npm run investigate -- --component flink --problem job_failure \\
+  npm run investigate -- --mode investigate --component flink --problem job_failure \\
     [--cluster uhadoop-xxxx] [--detail "Job FAILED"] [--job application_...] \\
     [--alert alerts.json] [--context '{"version":"1.17"}'] [--json]
 
+  npm run investigate -- --mode diagnose --component flink --problem job_failure \\
+    [--cluster uhadoop-xxxx] [--json]
+
 Options:
+  --mode       investigate (default) or diagnose (five-phase, YAML strategy)
   --component  Component: flink, hdfs, yarn, spark, hive, kafka
   --problem    Problem type, e.g. job_failure, checkpoint_failure, disk_full
   --cluster    UHadoop cluster instance id (production)
@@ -48,6 +54,7 @@ async function main(): Promise<void> {
     options: {
       component: { type: "string" },
       problem: { type: "string" },
+      mode: { type: "string", default: "investigate" },
       cluster: { type: "string" },
       detail: { type: "string" },
       job: { type: "string" },
@@ -68,6 +75,12 @@ async function main(): Promise<void> {
   const problem = values.problem?.trim();
   if (!component || !problem) {
     process.stderr.write(usage());
+    process.exitCode = 2;
+    return;
+  }
+  const mode = values.mode === "diagnose" ? "diagnose" : "investigate";
+  if (mode === "diagnose" && !values.cluster) {
+    process.stderr.write("error: --cluster is required for --mode diagnose\n");
     process.exitCode = 2;
     return;
   }
@@ -107,14 +120,19 @@ async function main(): Promise<void> {
   };
 
   const runtime = await createPiRuntime(config, sink);
+  const executor = mode === "diagnose" ? await McpToolExecutor.create(config) : undefined;
   try {
-    const { report, markdown } = await runInvestigation(runtime, input, sink);
+    const { report, markdown } =
+      mode === "diagnose" && executor
+        ? await runDiagnosis(runtime, executor, input, sink)
+        : await runInvestigation(runtime, input, sink);
     process.stdout.write(values.json ? `${JSON.stringify(report, null, 2)}\n` : markdown);
   } catch (error) {
     process.stderr.write(`error: ${errorMessage(error)}\n`);
     process.exitCode = 1;
   } finally {
     await runtime.close();
+    await executor?.close();
   }
 }
 

@@ -1,4 +1,4 @@
-# Local/runtime artifacts not needed to build the Go binaries.
+# Local/runtime artifacts not needed to build the Go or TS binaries.
 .git/
 .github/
 .claude/
@@ -7,6 +7,12 @@ conversation-archive/
 ucloud-flink-serverless/
 # Ignored local scripts (they hold cluster credentials; never shipped).
 diagflow/
+# TS agent build/runtime artifacts (the Dockerfile copies sources explicitly).
+ts-agent/node_modules/
+ts-agent/dist/
+ts-agent/.env
+ts-agent/.pi-agent/
+ts-agent/.agent-workspace/
 # Kubernetes manifests are not part of the image.
 deploy/kubernetes/
 *.tar.gz
