@@ -1,7 +1,7 @@
 # DiagFlow TS agent (Pi SDK) — parallel deployment next to diagflow-go.
 #
 # Render the tag and apply:
-#   export IMAGE_TAG=ts-0.1.0
+#   export IMAGE_TAG=ts-0.1.1
 #   envsubst < deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
 #
 # Prerequisites:

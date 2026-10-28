@@ -9,6 +9,7 @@ import {
 } from "./errors.js";
 import type { AgentEvent, EventSink } from "./events.js";
 import { McpToolExecutor } from "./mcp/tool-client.js";
+import { probeTcp } from "./net.js";
 import type { InvestigationInput, DiagnosisReport } from "./report/types.js";
 import { createPiRuntime } from "./runtime/pi.js";
 import { errorMessage } from "./util.js";
@@ -154,23 +155,49 @@ function main(): void {
       }
 
       if (request.method === "GET" && url.pathname === "/readyz") {
+        const [diagflowOk, promOk, alertOk] = await Promise.all([
+          config.diagflow.mcpUrl ? probeTcp(config.diagflow.mcpUrl) : Promise.resolve(false),
+          config.prometheus.url ? probeTcp(config.prometheus.url) : Promise.resolve(false),
+          config.prometheus.alertmanagerUrl
+            ? probeTcp(config.prometheus.alertmanagerUrl)
+            : Promise.resolve(false),
+        ]);
         const dataSource =
           Boolean(config.diagflow.mcpUrl) ||
           Boolean(config.prometheus.url) ||
           Boolean(config.prometheus.alertmanagerUrl);
+        const reachable = diagflowOk || promOk || alertOk;
         const llm = hasLlmCredential(config);
         const body = {
-          status: dataSource ? (llm ? "ready" : "degraded") : "not ready",
+          status: !dataSource
+            ? "not ready"
+            : !reachable
+              ? "not ready"
+              : llm
+                ? "ready"
+                : "degraded",
           checks: {
             llm: llm ? "ok" : "degraded",
-            diagflow_mcp: config.diagflow.mcpUrl ? "configured" : "disabled",
-            prometheus: config.prometheus.url ? "configured" : "disabled",
-            alertmanager: config.prometheus.alertmanagerUrl ? "configured" : "disabled",
+            diagflow_mcp: config.diagflow.mcpUrl
+              ? diagflowOk
+                ? "reachable"
+                : "unreachable"
+              : "disabled",
+            prometheus: config.prometheus.url
+              ? promOk
+                ? "reachable"
+                : "unreachable"
+              : "disabled",
+            alertmanager: config.prometheus.alertmanagerUrl
+              ? alertOk
+                ? "reachable"
+                : "unreachable"
+              : "disabled",
             api_auth: config.server.authToken ? "ok" : "degraded",
           },
           model: `${config.llm.provider}/${config.llm.modelId}`,
         };
-        sendJson(response, dataSource ? 200 : 503, body);
+        sendJson(response, dataSource && reachable ? 200 : 503, body);
         return;
       }
 
