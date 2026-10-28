@@ -7,7 +7,7 @@ import type {
   InvestigationInput,
   InvestigationStep,
 } from "../report/types.js";
-import { errorMessage, newEventId, truncate } from "../util.js";
+import { errorMessage, firstSentence, newEventId, truncate } from "../util.js";
 import type { AgentRuntime } from "../runtime/types.js";
 import { buildContext } from "./context.js";
 
@@ -22,7 +22,7 @@ function buildEvidence(steps: InvestigationStep[]): EvidenceItem[] {
     evidence.push({
       source_agent: "investigation",
       category: "judgment",
-      summary: truncate(step.judgment, 240),
+      summary: firstSentence(step.judgment, 120),
       detail: step.judgment,
       confidence: step.suspect_component_bug ? 0.6 : 0.7,
     });
@@ -30,7 +30,7 @@ function buildEvidence(steps: InvestigationStep[]): EvidenceItem[] {
       evidence.push({
         source_agent: step.actions[0]?.tool ?? "investigation",
         category: "tool_result",
-        summary: truncate(snippet, 240),
+        summary: firstSentence(snippet, 120),
         detail: truncate(snippet, 2_000),
         confidence: 0.8,
       });

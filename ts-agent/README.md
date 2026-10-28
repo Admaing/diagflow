@@ -14,6 +14,7 @@
 | Prometheus / Alertmanager MCP server | ✅ |
 | 意图生成 → 执行 → 合成（Investigate） | ✅ |
 | 五阶段 `Diagnose` + YAML 策略 + L1/L2 校验 | ✅ |
+| `health_check` 状态询问（区别于故障诊断） | ✅ |
 | KB 指纹快路径 / 高置信度回写 | ✅（进程内存，不持久） |
 | MySQL 持久化、DeepWiki、UCloud UNOC | ❌ |
 | 语义检索 / BM25 | ❌（Pi 版未接 embedder） |
@@ -31,6 +32,10 @@ synthesize                           Phase 3  ReAct 补证据
                                      Phase 4  合成 + L1/L2 + 一次重试
                                      Phase 5  high 置信度回写 KB
 ```
+
+问题类型启用 `health_check` 时走“状态询问”模式：prompt 明确告诉模型这是状态问题，报告
+渲染为“状态报告 / 当前状态 / 注意事项”，不写根因。适合“NameNode 现在什么情况”这类提问——
+否则报告会出现“问题类型 job_failure、结论 NameNode 正常”这种对不上的组合。
 
 两条路径共用：
 

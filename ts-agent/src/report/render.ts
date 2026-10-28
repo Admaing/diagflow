@@ -1,5 +1,5 @@
-import type { DiagnosisReport, EvidenceItem } from "./types.js";
-import { truncate } from "../util.js";
+import { isInquiry, type DiagnosisReport, type EvidenceItem } from "./types.js";
+import { isRedundantSummary, truncate } from "../util.js";
 
 function confidenceBadge(level: string): string {
   switch (level) {
@@ -19,18 +19,31 @@ function renderEvidence(items: EvidenceItem[]): string {
   return items
     .map((item) => {
       const source = item.source_agent || "unknown";
-      return `- **[${source}]** ${truncate(item.summary, 240)}`;
+      const summary = truncate(item.summary, 240);
+      // A summary that just repeats the detail would print the same sentence
+      // twice; keep only the expandable full text in that case.
+      const body = item.detail && !isRedundantSummary(item.summary, item.detail)
+        ? `${summary}\n  <details><summary>详情</summary>\n\n  ${item.detail.replace(/\n/g, "\n  ")}\n\n  </details>`
+        : item.detail
+          ? item.detail
+          : summary;
+      return `- **[${source}]** ${body}`;
     })
     .join("\n");
 }
 
 export function renderReport(report: DiagnosisReport): string {
   const lines: string[] = [];
-  lines.push(`# 诊断报告: ${report.component}.${report.problem_type}`);
+  const inquiry = isInquiry(report.problem_type);
+  lines.push(
+    inquiry
+      ? `# 状态报告: ${report.component}`
+      : `# 诊断报告: ${report.component}.${report.problem_type}`,
+  );
   lines.push("");
   lines.push(`- **事件 ID**: ${report.event_id}`);
   lines.push(`- **组件**: ${report.component}`);
-  lines.push(`- **问题类型**: ${report.problem_type}`);
+  lines.push(`- **问题类型**: ${inquiry ? "状态查看" : report.problem_type}`);
   lines.push(`- **状态**: ${report.status}`);
   lines.push(`- **耗时**: ${Math.round(report.duration_ms)}ms`);
   lines.push(`- **匹配知识库**: ${report.matched_knowledge ? "✅" : "❌"}`);
@@ -42,15 +55,15 @@ export function renderReport(report: DiagnosisReport): string {
   }
   lines.push("---");
   lines.push("");
-  lines.push("## 根因分析");
+  lines.push(inquiry ? "## 当前状态" : "## 根因分析");
   lines.push("");
-  lines.push(`**根因**: ${report.root_cause}`);
+  lines.push(inquiry ? `**状态**: ${report.root_cause}` : `**根因**: ${report.root_cause}`);
   lines.push("");
   lines.push(`**置信度**: ${confidenceBadge(report.confidence)}`);
   lines.push("");
   lines.push("---");
   lines.push("");
-  lines.push("## 修复建议");
+  lines.push(inquiry ? "## 注意事项" : "## 修复建议");
   lines.push("");
   report.suggestions.forEach((suggestion, index) => lines.push(`${index + 1}. ${suggestion}`));
   lines.push("");

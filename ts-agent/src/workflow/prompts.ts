@@ -1,4 +1,4 @@
-import type { IntentResult, InvestigationInput } from "../report/types.js";
+import { isInquiry, type IntentResult, type InvestigationInput } from "../report/types.js";
 import { safeJson, truncate } from "../util.js";
 
 function languageDirective(language: string): string {
@@ -10,7 +10,13 @@ function languageDirective(language: string): string {
 function contextBlock(input: InvestigationInput): string {
   const parts: string[] = [];
   parts.push(`组件: ${input.component}`);
-  parts.push(`问题: ${input.problem}`);
+  // A health check is a state question; showing it as 问题类型 makes the model
+  // hunt for a failure that was never reported.
+  if (isInquiry(input.problem)) {
+    parts.push("任务: 状态查看（用户询问当前状态，不涉及已报告的故障）");
+  } else {
+    parts.push(`问题: ${input.problem}`);
+  }
   if (input.clusterId) parts.push(`集群: ${input.clusterId}`);
   if (input.jobId) parts.push(`任务: ${input.jobId}`);
   if (input.detail) parts.push(`现象: ${input.detail}`);
@@ -20,6 +26,24 @@ function contextBlock(input: InvestigationInput): string {
     parts.push(`附加上下文: ${safeJson(input.context)}`);
   }
   return parts.join("\n");
+}
+
+/** Extra rules that apply only to a state question. Empty for a real incident. */
+function inquiryDirective(input: InvestigationInput): string {
+  if (!isInquiry(input.problem)) return "";
+  return `
+这是个状态询问，不是故障排查：
+- 只回答用户问的状态本身（进程、主备角色、日志异常、资源水位）。
+- 不要去找“根因”，也不要把正常状态写成“无法给出确定结论”。
+- 如果发现真实异常（例如组织架构层面的解码报错、长期为 0 的计数），
+  在 suggestions 里点出来即可，不要把它当作已发生的故障。
+`;
+}
+
+function inquirySynthesisRules(): string {
+  return `- 这是状态询问：root_cause 描述“当前状态”（哪些正常、哪些异常），不要写“根因”。
+- 状态正常时 confidence 用 "high"；有异常项时用 "medium" 并说明异常项。
+- suggestions 列出需要注意或继续观察的点，没有就写“暂无需要处理的项目”。`;
 }
 
 export function systemPrompt(language: string): string {
@@ -52,7 +76,7 @@ ${contextBlock(input)}
 不要提出“重启服务”“修改配置”这类写操作。
 
 只调用 propose_intents 工具提交结果，不要输出其他内容。
-${languageDirective(language)}`;
+${inquiryDirective(input)}${languageDirective(language)}`;
 }
 
 export function buildIntentExecutionPrompt(
@@ -114,5 +138,9 @@ ${traceBlock(trace)}
 - 如果证据不足，root_cause 写“证据不足，无法给出确定结论”，confidence 用 "low"。
 - suggestions 给出 2-4 条可执行建议。
 - 只调用 report_diagnosis 工具提交，不要在正文里输出 JSON。
-${feedback ? `\n上一次输出未通过校验，请修正：${feedback}\n` : ""}${languageDirective(language)}`;
+${
+  isInquiry(input.problem)
+    ? `${inquirySynthesisRules()}\n`
+    : ""
+}${feedback ? `\n上一次输出未通过校验，请修正：${feedback}\n` : ""}${languageDirective(language)}`;
 }

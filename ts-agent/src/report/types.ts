@@ -1,10 +1,23 @@
 export type Confidence = "high" | "medium" | "low";
 export type ReportStatus = "ok" | "degraded";
 
+/**
+ * `health_check` means the user asked about current state ("NameNode 现在是
+ * 什么情况") rather than reporting a failure. It must not be rendered as a root
+ * cause, or a healthy cluster reads as an unanswered incident.
+ */
+export const INQUIRY_PROBLEM = "health_check";
+
+export function isInquiry(problem: string): boolean {
+  return problem.trim().toLowerCase() === INQUIRY_PROBLEM;
+}
+
 export interface EvidenceItem {
   source_agent: string;
   category?: string;
+  /** One line, shown collapsed. Never a prefix of `detail`. */
   summary: string;
+  /** Full text, shown in an expandable block. */
   detail?: string;
   confidence?: number;
 }

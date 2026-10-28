@@ -2,7 +2,7 @@ import type { StepKind } from "../events.js";
 import type { FingerprintKB } from "../kb/fingerprint.js";
 import type { EvidenceItem, InvestigationInput, ToolAction } from "../report/types.js";
 import type { ToolExecutor } from "../tools/executor.js";
-import { errorMessage, truncate } from "../util.js";
+import { errorMessage, firstSentence, truncate } from "../util.js";
 import { groupByPriority, renderParams, shouldRun } from "./load.js";
 import type { DecideChoice, Step, Strategy } from "./types.js";
 
@@ -89,7 +89,7 @@ async function runToolStep(
       evidence.push({
         source_agent: `strategy:${step.tool}`,
         category: `tool:${step.tool}`,
-        summary: truncate(detail, 240),
+        summary: firstSentence(detail, 120),
         detail,
         confidence: 0.8,
       });
@@ -110,7 +110,6 @@ async function runToolStep(
       source_agent: `strategy:${step.tool}`,
       category: `tool:${step.tool}`,
       summary: message,
-      detail: message,
       confidence: 0.0,
     });
     options.emit("tool_error", message, step.tool);

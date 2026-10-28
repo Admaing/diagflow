@@ -12,7 +12,7 @@ import type { AgentRuntime } from "../runtime/types.js";
 import { detectErrorPattern, executeStrategy } from "../strategy/execute.js";
 import { buildTaskPrompt, loadStrategy } from "../strategy/load.js";
 import type { ToolExecutor } from "../tools/executor.js";
-import { errorMessage, newEventId, truncate } from "../util.js";
+import { errorMessage, firstSentence, newEventId, truncate } from "../util.js";
 import { validateConclusion } from "../validator/validator.js";
 import { buildContext } from "./context.js";
 
@@ -145,7 +145,7 @@ export async function runDiagnosis(
         evidence.push({
           source_agent: "react",
           category: "agent_analysis",
-          summary: truncate(reactText, 240),
+          summary: firstSentence(reactText, 120),
           detail: reactText,
           confidence: 0.7,
         });

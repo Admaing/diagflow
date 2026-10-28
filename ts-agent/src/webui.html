@@ -200,6 +200,7 @@
             <label for="problem">问题类型</label>
             <input id="problem" list="problems" value="job_failure" required>
             <datalist id="problems">
+              <option value="health_check"></option>
               <option value="job_failure"></option>
               <option value="checkpoint_failure"></option>
               <option value="disk_full"></option>
@@ -403,6 +404,9 @@
     reportBox.textContent = "";
     state.json = report;
     state.markdown = markdown || "";
+    // health_check asks about current state; rendering it as 根因 would read
+    // as an incident that was never reported.
+    const inquiry = String(report.problem_type || "").toLowerCase() === "health_check";
 
     const badges = document.createElement("div");
     badges.className = "badges";
@@ -427,10 +431,10 @@
     badges.appendChild(dur);
     reportBox.appendChild(badges);
 
-    reportBox.appendChild(section("根因"));
+    reportBox.appendChild(section(inquiry ? "当前状态" : "根因"));
     const cause = document.createElement("div");
     cause.className = "cause";
-    cause.textContent = report.root_cause || "（无根因）";
+    cause.textContent = report.root_cause || (inquiry ? "（无状态描述）" : "（无根因）");
     reportBox.appendChild(cause);
 
     if (report.warnings && report.warnings.length) {
@@ -440,7 +444,7 @@
       reportBox.appendChild(warn);
     }
 
-    reportBox.appendChild(section("修复建议"));
+    reportBox.appendChild(section(inquiry ? "注意事项" : "修复建议"));
     const ol = document.createElement("ol");
     ol.className = "suggestions";
     (report.suggestions || []).forEach((s) => {
@@ -464,7 +468,10 @@
       sum.textContent = item.summary || "";
       box.appendChild(src);
       box.appendChild(sum);
-      if (item.detail) {
+      // Skip the expander when detail just repeats the summary line.
+      const redundant = Boolean(item.detail) &&
+        item.summary.replace(/[\s…。.]+$/u, "") === item.detail.replace(/[\s…。.]+$/u, "");
+      if (item.detail && !redundant) {
         const details = document.createElement("details");
         const summary = document.createElement("summary");
         summary.textContent = "详情";
