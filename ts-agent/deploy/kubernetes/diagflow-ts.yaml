@@ -98,6 +98,16 @@ spec:
                 secretKeyRef:
                   name: diagflow-mcp-tokens
                   key: DIAGFLOW_MCP_CLIENT_TOKEN
+            # Console sessions (optional). Until a MySQL is deployed in this
+            # namespace, leave this unset: the console then runs single-shot and
+            # /api/v1/sessions returns 503.
+            # - name: TS_AGENT_MYSQL_URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: diagflow-secrets
+            #       key: MYSQL_URL
+            # - name: TS_AGENT_SESSION_MAX_TURNS
+            #   value: "5"
             # Monitoring (optional). Set these when Prometheus/Alertmanager are
             # reachable from this namespace; otherwise the agent still works
             # with diagflow tools alone.

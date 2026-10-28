@@ -41,6 +41,14 @@ export interface AgentConfig {
     stageTimeoutMs: number;
     maxConcurrent: number;
   };
+  /** Optional MySQL for console sessions. Disabled when `url` is unset. */
+  history: {
+    url?: string;
+    poolSize: number;
+    /** Turns of the same session replayed into the prompt as conclusions. */
+    maxTurns: number;
+    connectTimeoutMs: number;
+  };
   limits: {
     /** Per MCP tool call, in seconds (Pi MCP config uses seconds). */
     toolTimeoutS: number;
@@ -154,6 +162,12 @@ export function loadConfig(): AgentConfig {
       stageTimeoutMs: intEnv("TS_AGENT_STAGE_TIMEOUT_MS", 120_000),
       maxConcurrent: intEnv("TS_AGENT_MAX_CONCURRENT", 2),
     },
+    history: {
+      url: env("TS_AGENT_MYSQL_URL"),
+      poolSize: intEnv("TS_AGENT_MYSQL_POOL", 5),
+      maxTurns: intEnv("TS_AGENT_SESSION_MAX_TURNS", 5),
+      connectTimeoutMs: intEnv("TS_AGENT_MYSQL_CONNECT_TIMEOUT_MS", 3_000),
+    },
     limits: {
       toolTimeoutS: intEnv("TS_AGENT_TOOL_TIMEOUT_S", 90),
       maxToolResultChars: intEnv("TS_AGENT_MAX_TOOL_RESULT_CHARS", 8_000),
@@ -190,6 +204,9 @@ export function validateConfig(config: AgentConfig): string[] {
   // and resurface as a confusing "model not found" or an upstream 401.
   if (config.llm.modelsPath && !fs.existsSync(config.llm.modelsPath)) {
     problems.push(`TS_AGENT_MODELS_JSON does not exist: ${config.llm.modelsPath}`);
+  }
+  if (config.history.url && !/^mysql(s)?:\/\//i.test(config.history.url)) {
+    problems.push("TS_AGENT_MYSQL_URL must be a mysql:// URL");
   }
   return problems;
 }

@@ -10,11 +10,12 @@ import {
   StageTimeoutError,
 } from "./errors.js";
 import type { AgentEvent, EventSink } from "./events.js";
+import { HistoryStore } from "./history/store.js";
 import { McpToolExecutor } from "./mcp/tool-client.js";
 import { probeTcp } from "./net.js";
 import type { InvestigationInput, DiagnosisReport } from "./report/types.js";
 import { createPiRuntime } from "./runtime/pi.js";
-import { errorMessage } from "./util.js";
+import { errorMessage, truncate } from "./util.js";
 import { runDiagnosis } from "./workflow/diagnose.js";
 import { runInvestigation } from "./workflow/investigate.js";
 
@@ -38,6 +39,7 @@ const WEBUI_HTML = (() => {
 })();
 
 interface InvestigateRequest {
+  session_id?: string;
   component?: string;
   problem?: string;
   cluster_id?: string;
@@ -144,12 +146,26 @@ function authorized(request: http.IncomingMessage, config: AgentConfig): boolean
   return header === `Bearer ${config.server.authToken}`;
 }
 
+/**
+ * Anonymous console identity. The id is minted by the browser and kept in
+ * localStorage, so it is a pseudonym, not an authenticated user: it only keeps
+ * one browser's sessions together. Swapping in a gateway header or a verified
+ * JWT later means changing this function and nothing else.
+ */
+function callerId(request: http.IncomingMessage): string | undefined {
+  const raw = request.headers["x-diagflow-user"];
+  const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  if (!value) return undefined;
+  // Constrain to something safe to store and log; browsers send a UUID.
+  return /^[A-Za-z0-9._:-]{8,64}$/.test(value) ? value : undefined;
+}
+
 function writeSse(response: http.ServerResponse, event: AgentEvent): void {
   response.write(`event: ${event.type}\n`);
   response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const config = loadConfig();
   const problems = validateConfig(config);
   if (problems.length > 0) {
@@ -160,6 +176,7 @@ function main(): void {
 
   const semaphore = new Semaphore(config.server.maxConcurrent);
   const log = (message: string) => console.error(`[diagflow-ts] ${message}`);
+  const history = await HistoryStore.open(config.history.url, config.history, log);
 
   const server = http.createServer(async (request, response) => {
     try {
@@ -242,6 +259,13 @@ function main(): void {
       let mode: WorkflowMode | undefined;
       if (request.method === "POST" && basePath === "/api/v1/investigate") mode = "investigate";
       if (request.method === "POST" && basePath === "/api/v1/diagnose") mode = "diagnose";
+
+      // Console sessions. Without a store these endpoints report 503 rather than
+      // silently pretending the session was saved.
+      if (mode === undefined && url.pathname.startsWith("/api/v1/sessions")) {
+        await handleSessions(request, response, url, config, history);
+        return;
+      }
       if (!mode) {
         sendJson(response, 404, { error: { code: "not_found", message: "unknown route" } });
         return;
@@ -257,9 +281,9 @@ function main(): void {
       await semaphore.acquire();
       try {
         if (stream) {
-          await handleStream(request, response, config, log, mode);
+          await handleStream(request, response, config, log, mode, history);
         } else {
-          await handleJson(request, response, config, log, mode);
+          await handleJson(request, response, config, log, mode, history);
         }
       } finally {
         semaphore.release();
@@ -324,21 +348,164 @@ async function executeWorkflow(
   }
 }
 
+/**
+ * Resolve the session a request belongs to: attach the previous conclusions
+ * and return a writer for this turn. An unknown or foreign session id is a 404
+ * rather than a silent fresh start, so a stale browser tab cannot quietly
+ * diagnose without its history.
+ */
+async function resolveSession(
+  request: http.IncomingMessage,
+  body: InvestigateRequest,
+  history: HistoryStore | undefined,
+): Promise<{
+  history: InvestigationInput["history"];
+  record?: (report: DiagnosisReport, mode: WorkflowMode) => Promise<void>;
+}> {
+  const sessionId = body.session_id?.trim();
+  const store = history;
+  if (!sessionId || !store) return { history: undefined };
+  const userId = callerId(request);
+  if (!userId) {
+    throw Object.assign(new Error("session_id requires an X-Diagflow-User header"), {
+      statusCode: 400,
+      code: "user_id_required",
+    });
+  }
+  if (!(await store.ownsSession(userId, sessionId))) {
+    throw Object.assign(new Error(`unknown session ${sessionId}`), {
+      statusCode: 404,
+      code: "session_not_found",
+    });
+  }
+  const turns = await store.contextFor(userId, sessionId);
+  const question = (body.detail?.trim() || body.problem || "").slice(0, 2_000);
+  return {
+    history: turns.map((turn) => ({ question: turn.question, conclusion: turn.conclusion })),
+    record: async (report, mode) => {
+      await store.appendTurn({
+        sessionId,
+        eventId: report.event_id,
+        mode,
+        component: report.component,
+        problem: report.problem_type,
+        clusterId: body.cluster_id?.trim() ?? "",
+        // What the user typed, not the normalized input: this becomes the
+        // turn's label in the session and the line replayed into later prompts.
+        question,
+        conclusion: truncate(report.root_cause, 4_000),
+        confidence: report.confidence,
+      });
+    },
+  };
+}
+
 async function handleJson(
   request: http.IncomingMessage,
   response: http.ServerResponse,
   config: AgentConfig,
   log: (message: string) => void,
   mode: WorkflowMode,
+  history: HistoryStore | undefined,
 ): Promise<void> {
   const body = (await readBody(request)) as InvestigateRequest;
-  const input = toInput(body, mode);
+  const session = await resolveSession(request, body, history);
+  const input: InvestigationInput = {
+    ...toInput(body, mode),
+    ...(session.history ? { history: session.history } : {}),
+  };
   const { report, markdown } = await executeWorkflow(config, input, mode, () => undefined);
+  await session.record?.(report, mode);
   log(
     `done mode=${mode} event=${report.event_id} component=${report.component} ` +
       `status=${report.status} confidence=${report.confidence} duration_ms=${report.duration_ms}`,
   );
   sendJson(response, 200, { report, markdown });
+}
+
+/**
+ * Console session endpoints:
+ *   GET    /api/v1/sessions            list this browser's sessions
+ *   POST   /api/v1/sessions            create one
+ *   GET    /api/v1/sessions/:id        turns of one session
+ *   DELETE /api/v1/sessions/:id        remove one (cascades to its turns)
+ */
+async function handleSessions(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  url: URL,
+  config: AgentConfig,
+  history: HistoryStore | undefined,
+): Promise<void> {
+  if (!authorized(request, config)) {
+    sendJson(response, 401, {
+      error: { code: "unauthorized", message: "missing or invalid bearer token" },
+    });
+    return;
+  }
+  if (!history) {
+    sendJson(response, 503, {
+      error: { code: "history_disabled", message: "session history needs TS_AGENT_MYSQL_URL" },
+    });
+    return;
+  }
+  const userId = callerId(request);
+  if (!userId) {
+    sendJson(response, 400, {
+      error: { code: "user_id_required", message: "X-Diagflow-User header is required" },
+    });
+    return;
+  }
+
+  const rest = url.pathname.slice("/api/v1/sessions".length).replace(/^\//, "");
+  const sessionId = rest ? decodeURIComponent(rest) : undefined;
+
+  if (!sessionId) {
+    if (request.method === "GET") {
+      const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+      const sessions = await history.listSessions(userId, Number.isFinite(limit) ? limit : 20);
+      sendJson(response, 200, { sessions });
+      return;
+    }
+    if (request.method === "POST") {
+      const body = (await readBody(request)) as { title?: string };
+      const created = await history.createSession(userId, body.title?.trim() ?? "");
+      if (!created) {
+        sendJson(response, 500, {
+          error: { code: "session_create_failed", message: "database error" },
+        });
+        return;
+      }
+      sendJson(response, 201, { session: created });
+      return;
+    }
+    sendJson(response, 405, { error: { code: "method_not_allowed", message: request.method ?? "" } });
+    return;
+  }
+
+  if (request.method === "GET") {
+    // getTurns already scopes by user, so a foreign id would look empty;
+    // distinguish "not yours" from "has no turns" with an explicit check.
+    if (!(await history.ownsSession(userId, sessionId))) {
+      sendJson(response, 404, { error: { code: "session_not_found", message: sessionId } });
+      return;
+    }
+    const turns = await history.getTurns(userId, sessionId);
+    sendJson(response, 200, { session_id: sessionId, turns });
+    return;
+  }
+
+  if (request.method === "DELETE") {
+    const deleted = await history.deleteSession(userId, sessionId);
+    if (!deleted) {
+      sendJson(response, 404, { error: { code: "session_not_found", message: sessionId } });
+      return;
+    }
+    sendJson(response, 200, { deleted: sessionId });
+    return;
+  }
+
+  sendJson(response, 405, { error: { code: "method_not_allowed", message: request.method ?? "" } });
 }
 
 async function handleStream(
@@ -347,9 +514,14 @@ async function handleStream(
   config: AgentConfig,
   log: (message: string) => void,
   mode: WorkflowMode,
+  history: HistoryStore | undefined,
 ): Promise<void> {
   const body = (await readBody(request)) as InvestigateRequest;
-  const input = toInput(body, mode);
+  const session = await resolveSession(request, body, history);
+  const input: InvestigationInput = {
+    ...toInput(body, mode),
+    ...(session.history ? { history: session.history } : {}),
+  };
 
   response.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -368,7 +540,8 @@ async function handleStream(
   };
 
   try {
-    await executeWorkflow(config, input, mode, sink);
+    const { report } = await executeWorkflow(config, input, mode, sink);
+    await session.record?.(report, mode);
   } catch (error) {
     const status = errorStatus(error);
     log(`failed mode=${mode} code=${status.code} message=${status.message}`);
@@ -380,4 +553,7 @@ async function handleStream(
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(`[diagflow-ts] fatal: ${errorMessage(error)}`);
+  process.exit(1);
+});

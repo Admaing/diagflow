@@ -15,6 +15,7 @@
 | 意图生成 → 执行 → 合成（Investigate） | ✅ |
 | 五阶段 `Diagnose` + YAML 策略 + L1/L2 校验 | ✅ |
 | `health_check` 状态询问（区别于故障诊断） | ✅ |
+| 控制台会话（会话隔离、结论回放） | ✅（需 MySQL） |
 | KB 指纹快路径 / 高置信度回写 | ✅（进程内存，不持久） |
 | MySQL 持久化、DeepWiki、UCloud UNOC | ❌ |
 | 语义检索 / BM25 | ❌（Pi 版未接 embedder） |
@@ -107,6 +108,9 @@ cp .env.example .env
 | `TS_AGENT_MCP_STARTUP_WAIT_MS` | 等待 MCP 工具注册的上限，默认 `15000` |
 | `TS_AGENT_DEBUG` | `1` 时把模型输出和会话消息打到 stderr |
 | `TS_AGENT_STRATEGIES_DIR` | YAML 策略目录，默认仓库根 `data/strategies` |
+| `TS_AGENT_MYSQL_URL` | `mysql://user:pass@host:3306/diagflow`；不设则无会话 |
+| `TS_AGENT_SESSION_MAX_TURNS` | 回放进 prompt 的历史轮数，默认 `5` |
+| `TS_AGENT_MYSQL_POOL` | 连接池大小，默认 `5` |
 
 ### 模型与网关
 
@@ -176,6 +180,30 @@ npm run server
 | POST | `/api/v1/diagnose/stream` | 五阶段诊断 SSE |
 
 SSE 事件：`step` / `report` / `failed` / `done`。
+
+### 控制台会话
+
+设置 `TS_AGENT_MYSQL_URL` 后，控制台左侧出现会话列表：
+
+- **每个会话独立**：会话内的提问共享上下文，跨会话互不可见。
+- **只回放结论**：后续提问只带上本会话最近 `SESSION_MAX_TURNS` 轮的结论摘要，
+  原始工具输出不落库、不回放——诊断是对当前时刻的取证，回放旧日志会让模型把过期的
+  “正常”当成现在。prompt 里也明确要求本轮事实必须来自本轮工具调用。
+- **匿名身份**：`X-Diagflow-User` 由浏览器生成并存在 localStorage，只用于归组同一
+  浏览器的会话，不是登录态。接入真实身份时改 `server.ts` 的 `callerId()` 即可。
+- 没有该变量时会话接口返回 503，控制台退化为单次排查。
+
+接口：
+
+| Method | Path | 说明 |
+|---|---|---|
+| GET | `/api/v1/sessions` | 本浏览器的会话列表 |
+| POST | `/api/v1/sessions` | 新建会话 |
+| GET | `/api/v1/sessions/:id` | 会话的所有轮次 |
+| DELETE | `/api/v1/sessions/:id` | 删除会话（级联删除轮次） |
+
+建表语句在 `ts-agent/sql/session.sql`；服务启动时也会自动建表（`CREATE TABLE IF NOT EXISTS`）。
+作为参照，Go 版的表定义在仓库根的 `sql/schema.sql`——两套表名不同，互不冲突。
 
 ### Web 控制台
 

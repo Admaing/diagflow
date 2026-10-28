@@ -70,6 +70,13 @@ export interface InvestigationInput {
   alert?: Record<string, unknown>;
   timeRange?: { start: string; end: string };
   context?: Record<string, unknown>;
+  /** Earlier turns of the same console session: conclusions only, never raw tool output. */
+  history?: HistoryTurn[];
+}
+
+export interface HistoryTurn {
+  question: string;
+  conclusion: string;
 }
 
 export interface Intent {

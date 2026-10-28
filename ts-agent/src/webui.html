@@ -63,7 +63,31 @@
   .pill.warn .dot { background: var(--warn); }
   .pill.err { color: var(--err); border-color: rgba(255, 107, 129, .35); background: rgba(255, 107, 129, .08); }
   .pill.err .dot { background: var(--err); }
-  .layout { display: grid; grid-template-columns: 390px minmax(0, 1fr); gap: 18px; align-items: start; }
+  .layout { display: grid; grid-template-columns: 240px 390px minmax(0, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 1180px) { .layout { grid-template-columns: 390px minmax(0, 1fr); } .sessions { grid-column: 1 / -1; } }
+  @media (max-width: 820px) { .layout { grid-template-columns: minmax(0, 1fr); } .form { position: static; } }
+  .sessions { padding: 16px; position: sticky; top: 18px; max-height: calc(100vh - 64px); display: flex; flex-direction: column; }
+  .sessions .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .sessions .head .section-title { margin: 0; }
+  .sbtn {
+    border: 1px solid var(--border-strong); background: var(--panel-3); color: var(--text);
+    border-radius: 9px; padding: 6px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .sbtn:hover { border-color: var(--accent); }
+  .sbtn:disabled { opacity: .5; cursor: not-allowed; }
+  .slist { overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .sitem {
+    text-align: left; border: 1px solid transparent; background: var(--panel-2);
+    border-radius: 11px; padding: 9px 11px; cursor: pointer; color: var(--text); font: inherit;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .sitem:hover { border-color: var(--border-strong); }
+  .sitem.active { border-color: rgba(107, 141, 255, .55); background: rgba(107, 141, 255, .1); }
+  .sitem .t { font-size: 12.5px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sitem .m { font-size: 11px; color: var(--faint); display: flex; justify-content: space-between; gap: 6px; }
+  .sitem .del { color: var(--err); opacity: 0; font-size: 11px; }
+  .sitem:hover .del { opacity: 1; }
+  .sempty { color: var(--faint); font-size: 12px; padding: 10px 2px; }
   .card {
     background: linear-gradient(180deg, rgba(23, 32, 60, .55), rgba(13, 19, 39, .55));
     border: 1px solid var(--border); border-radius: 18px;
@@ -175,6 +199,15 @@
   </header>
 
   <div class="layout">
+    <aside class="card sessions">
+      <div class="head">
+        <div class="section-title">会话</div>
+        <button type="button" class="sbtn" id="new-session">+ 新建</button>
+      </div>
+      <div class="slist" id="session-list"><div class="sempty">加载中…</div></div>
+      <div class="hint" id="session-hint" style="color: var(--faint); font-size: 11px; margin-top: 10px;"></div>
+    </aside>
+
     <section class="card form">
       <div class="section-title">发起排查</div>
       <form id="diagnose-form">
@@ -273,7 +306,174 @@
   const reportBox = $("report");
   const empty = $("empty");
   const errorBox = { el: null };
-  const state = { running: false, startedAt: 0, timer: null, json: null, markdown: "" };
+  const state = {
+    running: false, startedAt: 0, timer: null, json: null, markdown: "",
+    sessionId: null, sessions: [], history: [],
+  };
+
+  // Anonymous identity: a random id per browser, not a login. It only groups
+  // this browser's sessions; replacing it with a gateway header/JWT later is a
+  // server-side change (callerId in server.ts).
+  const USER_KEY = "diagflow.ts.user";
+  function userId() {
+    try {
+      let id = localStorage.getItem(USER_KEY);
+      if (!id || !/^[A-Za-z0-9._:-]{8,64}$/.test(id)) {
+        id = "anon-" + (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+        localStorage.setItem(USER_KEY, id);
+      }
+      return id;
+    } catch (_) {
+      return "anon-" + String(Date.now()) + Math.random().toString(16).slice(2);
+    }
+  }
+
+  function apiHeaders(extra) {
+    const token = $("token").value.trim();
+    return Object.assign(
+      { "X-Diagflow-User": userId() },
+      token ? { Authorization: "Bearer " + token } : {},
+      extra || {},
+    );
+  }
+
+  async function api(path, options) {
+    const response = await fetch(path, Object.assign({ cache: "no-store" }, options, {
+      headers: apiHeaders((options && options.headers) || {}),
+    }));
+    let body = {};
+    try { body = await response.json(); } catch (_) {}
+    if (!response.ok) {
+      const err = new Error((body.error && body.error.message) || response.statusText);
+      err.code = body.error && body.error.code;
+      err.status = response.status;
+      throw err;
+    }
+    return body;
+  }
+
+  function fmtTime(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d)) return "";
+    return (d.getMonth() + 1) + "/" + d.getDate() + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  async function loadSessions() {
+    const list = $("session-list");
+    let sessions = [];
+    try {
+      const body = await api("/api/v1/sessions?limit=30");
+      sessions = body.sessions || [];
+      $("session-hint").textContent = "";
+    } catch (e) {
+      $("session-hint").textContent = e.status === 503
+        ? "未配置会话存储（TS_AGENT_MYSQL_URL），当前为无会话模式"
+        : "会话列表加载失败：" + (e.message || e);
+      list.innerHTML = "";
+      const empty = document.createElement("div");
+      empty.className = "sempty";
+      empty.textContent = "无会话";
+      list.appendChild(empty);
+      return;
+    }
+    state.sessions = sessions;
+    list.innerHTML = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "sempty";
+      empty.textContent = "还没有会话，点「+ 新建」开始";
+      list.appendChild(empty);
+      return;
+    }
+    sessions.forEach((session) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "sitem" + (session.id === state.sessionId ? " active" : "");
+      const title = document.createElement("span");
+      title.className = "t";
+      title.textContent = session.title || "(未命名会话)";
+      const meta = document.createElement("span");
+      meta.className = "m";
+      const turns = document.createElement("span");
+      turns.textContent = session.turns + " 轮 · " + fmtTime(session.updated_at);
+      const del = document.createElement("span");
+      del.className = "del";
+      del.textContent = "删除";
+      del.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        if (!confirm("删除这个会话及全部记录？")) return;
+        try {
+          await api("/api/v1/sessions/" + encodeURIComponent(session.id), { method: "DELETE" });
+          if (state.sessionId === session.id) state.sessionId = null;
+          await loadSessions();
+        } catch (e) {
+          alert("删除失败：" + (e.message || e));
+        }
+      });
+      meta.appendChild(turns);
+      meta.appendChild(del);
+      item.appendChild(title);
+      item.appendChild(meta);
+      item.addEventListener("click", () => selectSession(session.id));
+      list.appendChild(item);
+    });
+  }
+
+  async function newSession() {
+    try {
+      const body = await api("/api/v1/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      state.sessionId = body.session.id;
+      state.history = [];
+      await loadSessions();
+      renderSessionContext();
+      $("detail").focus();
+    } catch (e) {
+      $("session-hint").textContent = e.status === 503
+        ? "未配置会话存储（TS_AGENT_MYSQL_URL）"
+        : "新建会话失败：" + (e.message || e);
+    }
+  }
+
+  async function selectSession(id) {
+    state.sessionId = id;
+    try {
+      const body = await api("/api/v1/sessions/" + encodeURIComponent(id));
+      state.history = body.turns || [];
+      const last = state.history[state.history.length - 1];
+      if (last) {
+        $("component").value = last.component || $("component").value;
+        $("problem").value = last.problem || $("problem").value;
+        $("cluster").value = last.cluster_id || "";
+      }
+    } catch (e) {
+      state.history = [];
+      $("session-hint").textContent = "加载会话失败：" + (e.message || e);
+    }
+    await loadSessions();
+    renderSessionContext();
+  }
+
+  /** Show which conclusions the next request will carry, so the carry-over is visible. */
+  function renderSessionContext() {
+    const hint = $("session-hint");
+    if (!state.sessionId) { hint.textContent = "未选择会话：本次排查不携带任何历史"; return; }
+    if (!state.history.length) { hint.textContent = "新会话 · 本会话第 1 轮"; return; }
+    const items = state.history.map((turn) => {
+      const li = document.createElement("div");
+      li.style.margin = "6px 0 0";
+      li.textContent = "· " + (turn.question || turn.problem || "").slice(0, 40);
+      return li;
+    });
+    hint.textContent = "本会话已 " + state.history.length + " 轮，下一次提问会带上这些结论：";
+    items.forEach((el) => hint.appendChild(el));
+  }
+
+  $("new-session").addEventListener("click", newSession);
 
   // Token is per-browser convenience only.
   try { $("token").value = localStorage.getItem("diagflow.ts.token") || ""; } catch (_) {}
@@ -578,6 +778,7 @@
 
     const token = $("token").value.trim();
     const payload = {
+      ...(state.sessionId ? { session_id: state.sessionId } : {}),
       component,
       problem,
       ...(clusterId ? { cluster_id: clusterId } : {}),
@@ -599,10 +800,7 @@
     try {
       const response = await fetch("/api/v1/" + mode + "/stream", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: "Bearer " + token } : {}),
-        },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -622,8 +820,18 @@
       submit.disabled = false;
       submit.textContent = "开始排查";
       stopTimer();
+      if (state.sessionId) await refreshSession();
     }
   });
+
+  async function refreshSession() {
+    try {
+      const body = await api("/api/v1/sessions/" + encodeURIComponent(state.sessionId));
+      state.history = body.turns || [];
+      renderSessionContext();
+    } catch (_) {}
+    await loadSessions();
+  }
 
   async function copy(text, button) {
     try {
@@ -638,6 +846,7 @@
   $("copy-md").addEventListener("click", () => copy(state.markdown, $("copy-md")));
 
   refreshStatus();
+  loadSessions();
   setInterval(refreshStatus, 30000);
 })();
 </script>

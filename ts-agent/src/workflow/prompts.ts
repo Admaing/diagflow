@@ -40,6 +40,31 @@ function inquiryDirective(input: InvestigationInput): string {
 `;
 }
 
+/**
+ * Earlier turns of the same console session. Only conclusions are carried —
+ * raw tool output is not persisted, because replaying a snapshot from an hour
+ * ago is how a diagnosis quietly answers from stale evidence.
+ */
+function historyBlock(input: InvestigationInput, language: string): string {
+  const turns = input.history ?? [];
+  if (turns.length === 0) return "";
+  const lines = turns.map(
+    (turn, index) =>
+      `- 第 ${index + 1} 轮 问「${truncate(turn.question, 120)}」→ 结论：${truncate(turn.conclusion, 200)}`,
+  );
+  const rule =
+    language.toLowerCase().startsWith("en")
+      ? "History only tells you what the follow-up refers to. Every fact in this answer must come from tools called in this turn; never cite a historical conclusion as current state."
+      : "历史结论只用来理解这句话在问什么。本轮回答的每条事实都必须来自本轮调用工具的结果，"
+        + "绝不能把历史结论当作当前状态。";
+  return `
+本会话之前的排查（仅结论，不含当时的原始日志）：
+${lines.join("\n")}
+
+${rule}
+`;
+}
+
 function inquirySynthesisRules(): string {
   return `- 这是状态询问：root_cause 描述“当前状态”（哪些正常、哪些异常），不要写“根因”。
 - 状态正常时 confidence 用 "high"；有异常项时用 "medium" 并说明异常项。
@@ -67,7 +92,7 @@ export function buildIntentPrompt(
 ): string {
   return `正在排查以下问题：
 ${contextBlock(input)}
-
+${historyBlock(input, language)}
 可用数据源：
 - diagflow MCP：集群元数据、节点日志、YARN 应用、资源快照（只读）
 - prom MCP：Prometheus 指标查询、Alertmanager 告警
@@ -91,7 +116,7 @@ ${intent.reason ? `原因: ${intent.reason}` : ""}
 
 问题上下文：
 ${contextBlock(input)}
-
+${historyBlock(input, language)}
 规则：
 - 最多调用 4 次工具。
 - 只做只读查询。
@@ -129,7 +154,7 @@ export function buildSynthesisPrompt(
 ): string {
   return `根据以下排查记录，给出最终根因诊断：
 ${contextBlock(input)}
-
+${historyBlock(input, language)}
 排查记录：
 ${traceBlock(trace)}
 

@@ -19,3 +19,12 @@ test("web console has both workflow modes", () => {
   assert.match(html, /value="diagnose"/);
   assert.match(html, /value="investigate"/);
 });
+
+test("web console has anonymous session management", () => {
+  assert.match(html, /id="session-list"/);
+  assert.match(html, /id="new-session"/);
+  assert.match(html, /\/api\/v1\/sessions/);
+  assert.match(html, /X-Diagflow-User/);
+  assert.match(html, /session_id/);
+  assert.match(html, /diagflow\.ts\.user/);
+});
