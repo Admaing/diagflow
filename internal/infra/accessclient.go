@@ -68,12 +68,29 @@ func (f *FlexStrings) UnmarshalJSON(b []byte) error {
 		}
 		return nil
 	}
+	if trimmed[0] != '[' {
+		return fmt.Errorf("FlexStrings: expected string or array of strings, got %s", clipJSON(trimmed))
+	}
 	var many []string
 	if err := json.Unmarshal(trimmed, &many); err != nil {
 		return fmt.Errorf("FlexStrings: %w", err)
 	}
 	*f = FlexStrings(many)
 	return nil
+}
+
+// MarshalJSON always emits an array, so callers forwarding a node never have to
+// deal with the two shapes the access API mixes.
+func (f FlexStrings) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]string(f))
+}
+
+func clipJSON(b []byte) string {
+	const limit = 40
+	if len(b) <= limit {
+		return string(b)
+	}
+	return string(b[:limit]) + "..."
 }
 
 // NodeInfo mirrors the proto NodeInfo message (read-only subset).
