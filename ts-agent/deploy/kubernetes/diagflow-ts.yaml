@@ -1,0 +1,164 @@
+# DiagFlow TS agent (Pi SDK) — parallel deployment next to diagflow-go.
+#
+# Render the tag and apply:
+#   export IMAGE_TAG=ts-0.1.0
+#   envsubst < deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
+#
+# Prerequisites:
+#   - image hub.ucloudadmin.com/diaflow/diagflow-ts:${IMAGE_TAG} is built and pushed
+#   - Secret diagflow-secrets has DEEPSEEK_API_KEY and DIAGFLOW_AUTH_TOKEN
+#   - Secret diagflow-mcp-tokens has DIAGFLOW_MCP_CLIENT_TOKEN
+#   - Deployment/Service diagflow-mcp exists in this namespace
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diagflow-ts
+  namespace: prj-diaflow
+  labels:
+    app: diagflow-ts
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: diagflow-ts
+  template:
+    metadata:
+      labels:
+        app: diagflow-ts
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # node:22-bookworm-slim's "node" user.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: diagflow-ts
+          image: hub.ucloudadmin.com/diaflow/diagflow-ts:${IMAGE_TAG}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: NODE_ENV
+              value: "production"
+            # Pi/session scratch space; /tmp is an emptyDir below.
+            - name: HOME
+              value: "/tmp/diagflow-ts/home"
+            - name: TMPDIR
+              value: "/tmp"
+            - name: TS_AGENT_PORT
+              value: "8099"
+            - name: TS_AGENT_STRATEGIES_DIR
+              value: "/app/data/strategies"
+            - name: TS_AGENT_LANGUAGE
+              value: "zh-CN"
+            - name: TS_AGENT_MAX_CONCURRENT
+              value: "2"
+            - name: TS_AGENT_MCP_STARTUP_WAIT_MS
+              value: "15000"
+            # Model: DeepSeek is Pi's built-in provider. Switch to modelverse by
+            # mounting a models.json and changing provider/model (see ts-agent/README).
+            - name: PI_MODEL_PROVIDER
+              value: "deepseek"
+            - name: PI_MODEL_ID
+              value: "deepseek-flash"
+            - name: PI_THINKING_LEVEL
+              value: "medium"
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: diagflow-secrets
+                  key: DEEPSEEK_API_KEY
+            # Bearer token for POST /api/v1/{investigate,diagnose}. Reuses the
+            # Go service's token so one gateway rule covers both.
+            - name: TS_AGENT_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: diagflow-secrets
+                  key: DIAGFLOW_AUTH_TOKEN
+            # Cluster access: only through the read-only MCP gateway.
+            - name: DIAGFLOW_MCP_BASE_URL
+              value: "http://diagflow-mcp.prj-diaflow:8090/mcp"
+            - name: DIAGFLOW_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: diagflow-mcp-tokens
+                  key: DIAGFLOW_MCP_CLIENT_TOKEN
+            # Monitoring (optional). Set these when Prometheus/Alertmanager are
+            # reachable from this namespace; otherwise the agent still works
+            # with diagflow tools alone.
+            # - name: PROMETHEUS_URL
+            #   value: "http://prometheus:9090"
+            # - name: ALERTMANAGER_URL
+            #   value: "http://alertmanager:9093"
+          ports:
+            - containerPort: 8099
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      imagePullSecrets:
+        - name: paasuhadoop
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diagflow-ts
+  namespace: prj-diaflow
+  labels:
+    app: diagflow-ts
+spec:
+  selector:
+    app: diagflow-ts
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8099
+      targetPort: 8099
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: diagflow-ts
+  namespace: prj-diaflow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: diagflow-ts

@@ -200,11 +200,48 @@ npm test
 在仓库根目录构建（需要把 `data/strategies` 一起打进镜像）：
 
 ```bash
-docker build -f ts-agent/Dockerfile -t diagflow-ts-agent .
+docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.0 .
+docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.0
 ```
 
 运行时把 `DIAGFLOW_MCP_BASE_URL` / `DIAGFLOW_MCP_TOKEN` / `PROMETHEUS_URL` /
 模型凭据通过环境变量或 Secret 注入。
+
+## Kubernetes（prj-diaflow）
+
+清单：[ts-agent/deploy/kubernetes/diagflow-ts.yaml](deploy/kubernetes/diagflow-ts.yaml)
+
+```bash
+cd ..   # repo root
+export IMAGE_TAG=ts-0.1.0
+envsubst < ts-agent/deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
+x6 -n prj-diaflow rollout status deploy/diagflow-ts
+```
+
+依赖（namespace 内已存在）：
+
+| 资源 | 用途 |
+|---|---|
+| `deploy/diagflow-mcp` + `svc/diagflow-mcp:8090` | 集群只读网关 |
+| Secret `diagflow-mcp-tokens` / `DIAGFLOW_MCP_CLIENT_TOKEN` | MCP bearer token |
+| Secret `diagflow-secrets` / `DEEPSEEK_API_KEY` | 模型凭据 |
+| Secret `diagflow-secrets` / `DIAGFLOW_AUTH_TOKEN` | HTTP API bearer token |
+| `imagePullSecrets: paasuhadoop` | 拉取 `hub.ucloudadmin.com` 镜像 |
+
+`PROMETHEUS_URL` / `ALERTMANAGER_URL` 在清单里是注释状态；需要“监控”侧证据时
+取消注释并填入可达地址。没有它们时，`diagflow` 工具仍可单独工作。
+
+验证：
+
+```bash
+x6 -n prj-diaflow port-forward svc/diagflow-ts 8099:8099 &
+curl -s localhost:8099/healthz
+curl -s localhost:8099/readyz
+curl -s -X POST localhost:8099/api/v1/diagnose \
+  -H "Authorization: Bearer $TS_AGENT_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"component":"flink","problem":"job_failure","cluster_id":"uhadoop-xxxx"}'
+```
 
 ## 与 Go 的迁移路径
 
