@@ -268,10 +268,14 @@ export class PiAgentRuntime implements AgentRuntime {
     ensureRuntimeDirs(config);
     const emitter = new EventEmitter(sink);
 
-    // A project-local models.json lets the deployment declare a compatible
-    // endpoint (modelverse, vLLM, ...) without touching ~/.pi/agent.
+    // TS_AGENT_MODELS_JSON wins (the container mounts it read-only from a
+    // ConfigMap); otherwise a project-local models.json lets the deployment
+    // declare a compatible endpoint (modelverse, vLLM, ...) without touching
+    // ~/.pi/agent.
     const localModels = path.join(config.paths.agentDir, "models.json");
-    const modelsPath = fs.existsSync(localModels) ? localModels : undefined;
+    const modelsPath =
+      config.llm.modelsPath ??
+      (fs.existsSync(localModels) ? localModels : undefined);
 
     const modelRuntime = await ModelRuntime.create(
       modelsPath ? { modelsPath, authPath: path.join(path.dirname(modelsPath), "auth.json") } : {},
@@ -291,8 +295,11 @@ export class PiAgentRuntime implements AgentRuntime {
         .map((item) => item.id)
         .slice(0, 20)
         .join(", ");
+      const where = modelsPath
+        ? `modelsPath=${modelsPath}`
+        : "no models.json (set TS_AGENT_MODELS_JSON to declare a custom provider)";
       throw new ConfigError(
-        `unknown model ${config.llm.provider}/${config.llm.modelId}` +
+        `unknown model ${config.llm.provider}/${config.llm.modelId} (${where})` +
           (available ? `; available: ${available}` : `; unknown provider ${config.llm.provider}`),
       );
     }
@@ -349,6 +356,7 @@ export class PiAgentRuntime implements AgentRuntime {
     emitter.step(
       "phase",
       `agent ready: ${config.llm.provider}/${config.llm.modelId} ` +
+        `key=${config.llm.apiKeySource ?? "stored"} ` +
         `tools=[${activeTools.join(", ") || "none"}]`,
     );
     return runtime;

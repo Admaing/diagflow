@@ -4,3 +4,7 @@ dist/
 .pi-agent/
 .agent-workspace/
 *.log
+
+# Pi runtime credentials/snapshot written when the agent dir is the package root
+auth.json
+models-store.json

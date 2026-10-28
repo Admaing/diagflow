@@ -2,20 +2,19 @@
   "$schema": "https://pi.dev/schemas/models.schema.json",
   "providers": {
     "modelverse": {
-      "name": "Modelverse (DeepSeek via Anthropic/OpenAI-compatible proxy)",
-      "baseUrl": "https://api.modelverse.cn",
+      "name": "Modelverse (UCloud)",
+      "baseUrl": "https://api.modelverse.cn/v1",
       "api": "openai-completions",
-      "apiKey": "$MODELVERSE_API_KEY",
       "authHeader": true,
+      "compat": { "thinkingFormat": "deepseek" },
       "models": [
         {
-          "id": "deepseek-v4.1-flash",
-          "name": "DeepSeek V4.1 Flash (modelverse)",
+          "id": "deepseek-v4.1-flash-1017",
+          "name": "DeepSeek V4.1 Flash 1017 (modelverse)",
           "reasoning": true,
           "contextWindow": 1000000,
           "maxTokens": 64000,
-          "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.006, "cacheWrite": 0 },
-          "compat": { "thinkingFormat": "deepseek" }
+          "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.006, "cacheWrite": 0 }
         }
       ]
     }

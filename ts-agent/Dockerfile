@@ -15,9 +15,13 @@ ENV TS_AGENT_STRATEGIES_DIR=/app/data/strategies
 # The runtime needs writable scratch dirs for Pi sessions/agent state.
 ENV TS_AGENT_AGENT_DIR=/tmp/diagflow-ts/agent
 ENV TS_AGENT_WORKSPACE=/tmp/diagflow-ts/workspace
+# Custom provider catalog (modelverse). The deployment swaps in a ConfigMap;
+# this keeps the DeepSeek-only default working when none is mounted.
+ENV TS_AGENT_MODELS_JSON=/app/models.json
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
 COPY --from=build /src/package.json ./package.json
+COPY ts-agent/models.json ./models.json
 COPY data/strategies ./data/strategies
 USER node
 EXPOSE 8099

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "modelverse": {
+      "name": "Modelverse (UCloud)",
+      "baseUrl": "https://api.modelverse.cn/v1",
+      "api": "openai-completions",
+      "authHeader": true,
+      "compat": { "thinkingFormat": "deepseek" },
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash-1017",
+          "name": "DeepSeek V4.1 Flash 1017 (modelverse)",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 64000,
+          "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.006, "cacheWrite": 0 }
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash (modelverse)",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 64000,
+          "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.006, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
-import { hasLlmCredential, ensureRuntimeDirs, loadConfig, validateConfig, type AgentConfig } from "./config.js";
+import { hasLlmCredential, ensureRuntimeDirs, llmConfigHint, loadConfig, validateConfig, type AgentConfig } from "./config.js";
 import {
   ConfigError,
   LlmUnavailableError,
@@ -285,6 +285,11 @@ function main(): void {
   server.listen(config.server.port, () => {
     log(`listening on :${config.server.port}`);
     log(`model=${config.llm.provider}/${config.llm.modelId}`);
+    log(`model key=${config.llm.apiKeySource ?? "none"}`);
+    // Surface a mismatched provider/key pair at boot instead of as a 401 deep
+    // in the first diagnosis.
+    const hint = llmConfigHint(config);
+    if (hint) log(`config warning: ${hint}`);
     log(
       `sources: diagflow=${config.diagflow.mcpUrl ?? "disabled"} ` +
         `prom=${config.prometheus.url ?? "disabled"} ` +

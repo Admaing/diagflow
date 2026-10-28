@@ -62,7 +62,7 @@ Pi AgentSession ── MCP ──► diagflow-mcp / prom
 ## 前置条件
 
 - Node.js **>= 22.19**（Pi SDK 要求）
-- 一个 Pi 支持的模型凭据（默认 DeepSeek：`DEEPSEEK_API_KEY`）
+- 一个模型凭据（默认 modelverse：`MODELVERSE_API_KEY`）
 - 一个可达的 `diagflow-mcp`（可选，但生产环境应有）
 - Prometheus / Alertmanager（可选）
 
@@ -79,9 +79,12 @@ cp .env.example .env
 
 | 变量 | 说明 |
 |---|---|
-| `DEEPSEEK_API_KEY` | DeepSeek 凭据；或 `TS_AGENT_LLM_API_KEY` |
-| `PI_MODEL_PROVIDER` | 默认 `deepseek` |
-| `PI_MODEL_ID` | 默认 `deepseek-flash`；可选 `deepseek-v4-pro` |
+| `MODELVERSE_API_KEY` | modelverse 网关凭据（默认 provider 使用） |
+| `TS_AGENT_LLM_API_KEY` | 通用凭据，**优先级最高**，任何 provider 都可用 |
+| `DEEPSEEK_API_KEY` | 仅 Pi 内置 `deepseek` provider（`api.deepseek.com`）使用 |
+| `PI_MODEL_PROVIDER` | 默认 `modelverse` |
+| `PI_MODEL_ID` | 默认 `deepseek-v4.1-flash-1017` |
+| `TS_AGENT_MODELS_JSON` | provider 目录，默认 `./models.json`（镜像内 `/app/models.json`） |
 | `PI_THINKING_LEVEL` | `off` / `low` / `medium` / `high`，默认 `medium` |
 | `DIAGFLOW_MCP_BASE_URL` | 例如 `http://diagflow-mcp:8090/mcp` |
 | `DIAGFLOW_MCP_TOKEN` | MCP bearer token |
@@ -100,8 +103,30 @@ cp .env.example .env
 | `TS_AGENT_DEBUG` | `1` 时把模型输出和会话消息打到 stderr |
 | `TS_AGENT_STRATEGIES_DIR` | YAML 策略目录，默认仓库根 `data/strategies` |
 
-如果要走 modelverse 等 Anthropic/OpenAI 兼容网关，在 `~/.pi/agent/models.json` 里配置
-Pi 的 custom provider，然后设置 `PI_MODEL_PROVIDER` / `PI_MODEL_ID`。
+### 模型与网关
+
+默认走 UCloud modelverse（OpenAI 兼容，`https://api.modelverse.cn/v1`），provider 定义在
+`ts-agent/models.json`，部署时以 ConfigMap 挂到 `/etc/diagflow-ts/models.json`：
+
+```json
+{ "providers": { "modelverse": { "baseUrl": "https://api.modelverse.cn/v1",
+  "api": "openai-completions", "authHeader": true,
+  "models": [{ "id": "deepseek-v4.1-flash-1017", "reasoning": true }] } } }
+```
+
+凭据解析顺序：`TS_AGENT_LLM_API_KEY` → provider 自己的变量（`MODELVERSE_API_KEY` /
+`DEEPSEEK_API_KEY` …）→ modelverse。启动日志会打印实际使用的变量名：
+
+```
+[diagflow-ts] model=modelverse/deepseek-v4.1-flash-1017
+[diagflow-ts] model key=MODELVERSE_API_KEY
+```
+
+**不要把网关 token 放进 `DEEPSEEK_API_KEY`**：那是 `api.deepseek.com` 的 key，网关会返回
+`401 Authentication Fails`。混用时启动日志和 `/readyz` 会给出 `config warning`。
+
+如果网关有 IP 白名单，看到的是 **Pod 出集群的 IP**（节点 IP 或 NAT 出口 IP，不是浏览器所在
+机器的 IP），用 Pod 内 `fetch('https://api.ipify.org')` 或报错里的 request_id 让网关侧确认。
 
 ## CLI
 
@@ -171,18 +196,21 @@ curl -s localhost:8099/api/v1/diagnose \
 
 | 文件 | 说明 |
 |---|---|
-| `models.example.json` | 自定义 provider 示例（modelverse）。复制到 `.pi-agent/models.json` 后生效 |
+| `models.json` | provider 目录（默认 modelverse），`TS_AGENT_MODELS_JSON` 或 `.pi-agent/models.json` 生效 |
+| `models.example.json` | 单模型精简示例 |
 | `.env.example` | 全部环境变量 |
 
 项目会在 `<TS_AGENT_AGENT_DIR>/models.json` 存在时用它加载模型目录，因此可以完全
 不碰 `~/.pi/agent`。示例：
 
 ```bash
-cp models.example.json .pi-agent/models.json
-export MODELVERSE_API_KEY=sk-...
+export MODELVERSE_API_KEY=...
 export PI_MODEL_PROVIDER=modelverse
-export PI_MODEL_ID=deepseek-v4.1-flash
+export PI_MODEL_ID=deepseek-v4.1-flash-1017
 ```
+
+`~/.pi/agent/models.json` 仍然生效（`TS_AGENT_MODELS_JSON` 未设置且 `.pi-agent/models.json`
+不存在时），项目内文件优先。
 
 ## 调试
 
@@ -213,8 +241,8 @@ npm test
 在仓库根目录构建（需要把 `data/strategies` 一起打进镜像）：
 
 ```bash
-docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.3 .
-docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.3
+docker build -f ts-agent/Dockerfile -t hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.4 .
+docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.4
 ```
 
 运行时把 `DIAGFLOW_MCP_BASE_URL` / `DIAGFLOW_MCP_TOKEN` / `PROMETHEUS_URL` /
@@ -226,7 +254,7 @@ docker push hub.ucloudadmin.com/diaflow/diagflow-ts:ts-0.1.3
 
 ```bash
 cd ..   # repo root
-export IMAGE_TAG=ts-0.1.3
+export IMAGE_TAG=ts-0.1.4
 envsubst < ts-agent/deploy/kubernetes/diagflow-ts.yaml | x6 apply -f -
 x6 -n prj-diaflow rollout status deploy/diagflow-ts
 ```
@@ -237,7 +265,8 @@ x6 -n prj-diaflow rollout status deploy/diagflow-ts
 |---|---|
 | `deploy/diagflow-mcp` + `svc/diagflow-mcp:8090` | 集群只读网关 |
 | Secret `diagflow-mcp-tokens` / `DIAGFLOW_MCP_CLIENT_TOKEN` | MCP bearer token |
-| Secret `diagflow-secrets` / `DEEPSEEK_API_KEY` | 模型凭据 |
+| Secret `diagflow-secrets` / `MODELVERSE_API_KEY` | 模型网关凭据 |
+| ConfigMap `diagflow-ts-models` | provider 目录，挂到 `/etc/diagflow-ts/models.json` |
 | Secret `diagflow-secrets` / `DIAGFLOW_AUTH_TOKEN` | HTTP API bearer token |
 | `imagePullSecrets: paasuhadoop` | 拉取 `hub.ucloudadmin.com` 镜像 |
 
@@ -269,8 +298,8 @@ v4：删除 Go diagagent，保留 diagflow-mcp
 
 ## 已知限制
 
-- Pi SDK 的模型目录使用 `deepseek-flash` / `deepseek-v4-pro`；Go 版默认的
-  `deepseek-v4.1-flash` 是 modelverse 的模型名，需要在 Pi 里配 custom provider。
+- 模型名以 modelverse 目录为准（`deepseek-v4.1-flash-1017` 等）；Pi 内置的
+  `deepseek-flash` / `deepseek-v4-pro` 属于 DeepSeek 官方平台，与网关不通用。
 - 每个 HTTP 请求创建一个新的 Pi session 和 MCP 子进程；并发上限默认 2。
 - `diagnose` 模式会额外建立一个直连 MCP client 执行 YAML 策略，因此一次请求会有
   两组 MCP 连接（Pi 一组、策略一组）。

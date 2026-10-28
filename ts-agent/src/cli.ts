@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { hasLlmCredential, loadConfig, validateConfig } from "./config.js";
+import { hasLlmCredential, llmConfigHint, loadConfig, validateConfig } from "./config.js";
 import type { EventSink } from "./events.js";
 import { McpToolExecutor } from "./mcp/tool-client.js";
 import type { InvestigationInput } from "./report/types.js";
@@ -98,6 +98,8 @@ async function main(): Promise<void> {
       "warning: no LLM credential found (DEEPSEEK_API_KEY / TS_AGENT_LLM_API_KEY / ~/.pi/agent/auth.json)\n",
     );
   }
+  const llmHint = llmConfigHint(config);
+  if (llmHint) process.stderr.write(`config warning: ${llmHint}\n`);
 
   const input: InvestigationInput = {
     component,
